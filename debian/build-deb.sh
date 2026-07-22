@@ -10,7 +10,7 @@
 # Prerequisites: dpkg-deb, fakeroot
 # Output: clamui_VERSION_all.deb in the project root
 
-
+pu
 set -e
 
 # Colors for output (only if terminal supports it)

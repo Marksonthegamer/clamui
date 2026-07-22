@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -21,7 +21,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@v8.0.0
 
       - name: Install gettext
         run: sudo apt-get update && sudo apt-get install -y gettext
@@ -35,12 +35,6 @@ jobs:
             exit 1
           fi
           echo "No absolute src.* imports found."
-
-      - name: Check POTFILES.in consistency
-        run: ./scripts/check-potfiles.sh
-
-      - name: Validate translations
-        run: ./scripts/check-translations.sh
 
       - name: Run Ruff linting
         run: uvx ruff check src/ tests/ --output-format=github

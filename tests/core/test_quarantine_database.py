@@ -470,6 +470,120 @@ class TestQuarantineDatabase:
         assert len(old_entries) == 0
 
 
+class TestQuarantineDatabasePermissionMasking:
+    """Regression tests for VULN-004 — defense-in-depth permission masking.
+
+    Original ``original_permissions`` values must be masked to ``& 0o777``
+    on both write and read paths so that setuid/setgid/sticky bits cannot
+    propagate from a tampered DB row into a restored file's mode.
+    """
+
+    @pytest.fixture
+    def temp_db_dir(self):
+        """Create a temporary directory for database storage."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield tmpdir
+
+    @pytest.fixture
+    def db(self, temp_db_dir):
+        """Create a QuarantineDatabase with a temporary database."""
+        db_path = os.path.join(temp_db_dir, "test_quarantine.db")
+        database = QuarantineDatabase(db_path=db_path)
+        yield database
+        database.close()
+
+    def test_add_entry_masks_high_permission_bits(self, db, temp_db_dir):
+        """add_entry must mask away setuid/setgid/sticky bits before insert."""
+        db.add_entry(
+            original_path="/home/user/setuid-malware",
+            quarantine_path="/quarantine/setuid.quar",
+            threat_name="SetuidThreat",
+            file_size=4096,
+            file_hash="setuidhash",
+            original_permissions=0o6755,  # setuid + setgid + 0o755
+        )
+
+        # Read raw column value directly to verify storage was masked.
+        db_path = os.path.join(temp_db_dir, "test_quarantine.db")
+        conn = sqlite3.connect(db_path)
+        try:
+            cursor = conn.execute(
+                "SELECT original_permissions FROM quarantine WHERE quarantine_path = ?",
+                ("/quarantine/setuid.quar",),
+            )
+            (stored,) = cursor.fetchone()
+        finally:
+            conn.close()
+
+        assert stored == 0o755, f"DB stored {oct(stored)}, expected {oct(0o755)}"
+
+    def test_from_row_masks_high_permission_bits(self, db, temp_db_dir):
+        """from_row must mask high bits even if the DB was tampered."""
+        # Bypass the API and write a tampered row directly.
+        db_path = os.path.join(temp_db_dir, "test_quarantine.db")
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute("PRAGMA ignore_check_constraints = ON")
+            conn.execute(
+                """
+                INSERT INTO quarantine
+                (original_path, quarantine_path, threat_name, detection_date,
+                 file_size, file_hash, original_permissions)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "/home/user/tampered",
+                    "/quarantine/tampered.quar",
+                    "TamperedThreat",
+                    "2026-04-30T00:00:00",
+                    1024,
+                    "tamperedhash",
+                    0o6755,  # tampered: setuid + setgid + 755
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        entry = db.get_entry_by_original_path("/home/user/tampered")
+        assert entry is not None
+        # The materialized entry must NOT carry the high bits.
+        assert entry.original_permissions == 0o755, (
+            f"from_row returned {oct(entry.original_permissions)}, expected {oct(0o755)}"
+        )
+
+    def test_from_row_preserves_legacy_default_when_column_missing(self):
+        """Legacy DB rows missing the column still default to 0o644 (regression guard)."""
+        row = (
+            1,
+            "/legacy/file",
+            "/quarantine/legacy.quar",
+            "LegacyThreat",
+            "2024-01-01T00:00:00",
+            512,
+            "legacyhash",
+            # No original_permissions column
+        )
+        entry = QuarantineEntry.from_row(row)
+        assert entry.original_permissions == 0o644
+
+    def test_from_row_handles_none_permissions(self):
+        """A NULL original_permissions value (corrupted row) must default safely."""
+        row = (
+            1,
+            "/null/file",
+            "/quarantine/null.quar",
+            "NullThreat",
+            "2024-01-01T00:00:00",
+            512,
+            "nullhash",
+            None,
+        )
+        entry = QuarantineEntry.from_row(row)
+        # Implementation may default to 0o644 — masking a None must NOT crash.
+        assert entry.original_permissions == 0o644
+
+
 class TestQuarantineDatabaseErrorLogging:
     """Tests for error logging in QuarantineDatabase."""
 

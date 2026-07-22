@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -59,7 +59,7 @@ jobs:
           echo "Signature member verified in .deb archive"
 
       - name: Upload Debian package artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: debian-package
           path: clamui_*.deb

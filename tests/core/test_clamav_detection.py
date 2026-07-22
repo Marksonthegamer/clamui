@@ -214,6 +214,34 @@ class TestCheckFreshclamInstalled:
                     clamav_detection.check_freshclam_installed()
                     mock_wrap.assert_called_once_with(["freshclam", "--version"])
 
+    def test_check_freshclam_flatpak_uses_host_version_command(self):
+        """Flatpak freshclam check should not generate sandbox config."""
+        with mock.patch.object(
+            clamav_detection, "which_host_command", return_value="/usr/bin/freshclam"
+        ):
+            with mock.patch.object(clamav_detection, "is_flatpak", return_value=True):
+                with mock.patch.object(
+                    clamav_detection,
+                    "wrap_host_command",
+                    return_value=[
+                        "flatpak-spawn",
+                        "--host",
+                        "freshclam",
+                        "--version",
+                    ],
+                ) as mock_wrap:
+                    with mock.patch("subprocess.run") as mock_run:
+                        mock_run.return_value = mock.Mock(
+                            returncode=0,
+                            stdout="ClamAV 1.2.3\n",
+                            stderr="",
+                        )
+                        installed, version = clamav_detection.check_freshclam_installed()
+
+        assert installed is True
+        assert "ClamAV" in version
+        mock_wrap.assert_called_once_with(["freshclam", "--version"])
+
 
 class TestCheckClamdscanInstalled:
     """Tests for check_clamdscan_installed() function."""
@@ -785,7 +813,7 @@ class TestCheckDatabaseAvailable:
         db_file.write_text("mock database content")
 
         with mock.patch.object(clamav_detection, "is_flatpak", return_value=False):
-            with mock.patch("pathlib.Path", return_value=tmp_path) as mock_path:
+            with mock.patch("src.core.clamav_detection.Path", return_value=tmp_path) as mock_path:
                 # Make Path("/var/lib/clamav") return tmp_path
                 mock_path.return_value = tmp_path
                 is_available, error = clamav_detection.check_database_available()
@@ -798,7 +826,7 @@ class TestCheckDatabaseAvailable:
         db_file.write_text("mock database content")
 
         with mock.patch.object(clamav_detection, "is_flatpak", return_value=False):
-            with mock.patch("pathlib.Path", return_value=tmp_path):
+            with mock.patch("src.core.clamav_detection.Path", return_value=tmp_path):
                 is_available, error = clamav_detection.check_database_available()
                 assert is_available is True
                 assert error is None
@@ -809,7 +837,7 @@ class TestCheckDatabaseAvailable:
         db_file.write_text("mock database content")
 
         with mock.patch.object(clamav_detection, "is_flatpak", return_value=False):
-            with mock.patch("pathlib.Path", return_value=tmp_path):
+            with mock.patch("src.core.clamav_detection.Path", return_value=tmp_path):
                 is_available, error = clamav_detection.check_database_available()
                 assert is_available is True
                 assert error is None
@@ -817,7 +845,7 @@ class TestCheckDatabaseAvailable:
     def test_check_database_available_empty_directory(self, tmp_path):
         """Test check_database_available returns False when directory is empty."""
         with mock.patch.object(clamav_detection, "is_flatpak", return_value=False):
-            with mock.patch("pathlib.Path", return_value=tmp_path):
+            with mock.patch("src.core.clamav_detection.Path", return_value=tmp_path):
                 is_available, error = clamav_detection.check_database_available()
                 assert is_available is False
                 assert "No virus database files found" in error
@@ -829,7 +857,7 @@ class TestCheckDatabaseAvailable:
         (tmp_path / "config.conf").write_text("config")
 
         with mock.patch.object(clamav_detection, "is_flatpak", return_value=False):
-            with mock.patch("pathlib.Path", return_value=tmp_path):
+            with mock.patch("src.core.clamav_detection.Path", return_value=tmp_path):
                 is_available, error = clamav_detection.check_database_available()
                 assert is_available is False
                 assert "No virus database files found" in error
@@ -839,7 +867,7 @@ class TestCheckDatabaseAvailable:
         non_existent = tmp_path / "non_existent"
 
         with mock.patch.object(clamav_detection, "is_flatpak", return_value=False):
-            with mock.patch("pathlib.Path", return_value=non_existent):
+            with mock.patch("src.core.clamav_detection.Path", return_value=non_existent):
                 is_available, error = clamav_detection.check_database_available()
                 assert is_available is False
                 assert "does not exist" in error
@@ -852,7 +880,7 @@ class TestCheckDatabaseAvailable:
         mock_path.iterdir.side_effect = PermissionError("Access denied")
 
         with mock.patch.object(clamav_detection, "is_flatpak", return_value=False):
-            with mock.patch("pathlib.Path", return_value=mock_path):
+            with mock.patch("src.core.clamav_detection.Path", return_value=mock_path):
                 is_available, error = clamav_detection.check_database_available()
                 assert is_available is False
                 assert "Permission denied" in error
@@ -865,32 +893,40 @@ class TestCheckDatabaseAvailable:
         mock_path.iterdir.side_effect = OSError("Disk error")
 
         with mock.patch.object(clamav_detection, "is_flatpak", return_value=False):
-            with mock.patch("pathlib.Path", return_value=mock_path):
+            with mock.patch("src.core.clamav_detection.Path", return_value=mock_path):
                 is_available, error = clamav_detection.check_database_available()
                 assert is_available is False
                 assert "Error accessing database" in error
 
-    def test_check_database_available_flatpak_with_database(self, tmp_path):
-        """Test check_database_available in Flatpak environment with database."""
-        db_file = tmp_path / "main.cvd"
-        db_file.write_text("mock database content")
-
+    def test_check_database_available_flatpak_with_host_database(self):
+        """Test check_database_available in Flatpak checks host database dirs."""
         with mock.patch.object(clamav_detection, "is_flatpak", return_value=True):
-            with mock.patch(
-                "src.core.flatpak.get_clamav_database_dir",
-                return_value=tmp_path,
+            with mock.patch.object(
+                clamav_detection, "_host_database_dirs_to_check", return_value=["/var/lib/clamav"]
             ):
-                is_available, error = clamav_detection.check_database_available()
-                assert is_available is True
-                assert error is None
+                with mock.patch.object(
+                    clamav_detection,
+                    "_host_path_contains_database_file",
+                    return_value=(True, None),
+                ):
+                    is_available, error = clamav_detection.check_database_available()
+                    assert is_available is True
+                    assert error is None
 
-    def test_check_database_available_flatpak_no_database_dir(self):
-        """Test check_database_available in Flatpak when database dir is None."""
+    def test_check_database_available_flatpak_no_host_database(self):
+        """Test check_database_available in Flatpak when host databases are missing."""
         with mock.patch.object(clamav_detection, "is_flatpak", return_value=True):
-            with mock.patch("src.core.flatpak.get_clamav_database_dir", return_value=None):
-                is_available, error = clamav_detection.check_database_available()
-                assert is_available is False
-                assert "Could not determine Flatpak database directory" in error
+            with mock.patch.object(
+                clamav_detection, "_host_database_dirs_to_check", return_value=["/var/lib/clamav"]
+            ):
+                with mock.patch.object(
+                    clamav_detection,
+                    "_host_path_contains_database_file",
+                    return_value=(False, "No virus database files found"),
+                ):
+                    is_available, error = clamav_detection.check_database_available()
+                    assert is_available is False
+                    assert "host ClamAV virus database" in error
 
     def test_check_database_available_case_insensitive_extension(self, tmp_path):
         """Test check_database_available handles uppercase extensions."""
@@ -898,7 +934,7 @@ class TestCheckDatabaseAvailable:
         db_file.write_text("mock database content")
 
         with mock.patch.object(clamav_detection, "is_flatpak", return_value=False):
-            with mock.patch("pathlib.Path", return_value=tmp_path):
+            with mock.patch("src.core.clamav_detection.Path", return_value=tmp_path):
                 is_available, error = clamav_detection.check_database_available()
                 assert is_available is True
                 assert error is None

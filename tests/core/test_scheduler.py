@@ -2,6 +2,7 @@
 """Unit tests for the Scheduler class."""
 
 import os
+import shlex
 import sys
 import tempfile
 from pathlib import Path
@@ -377,7 +378,7 @@ class TestSchedulerServiceFiles:
     def test_generate_service_file(self, scheduler):
         """Test service file generation."""
         service = scheduler._generate_service_file(
-            cli_path="/usr/bin/clamui-scheduled-scan",
+            cli_command=["/usr/bin/clamui-scheduled-scan"],
             targets=["/home/user/Documents"],
             skip_on_battery=True,
             auto_quarantine=False,
@@ -396,7 +397,7 @@ class TestSchedulerServiceFiles:
     def test_generate_service_file_with_quarantine(self, scheduler):
         """Test service file generation with quarantine enabled."""
         service = scheduler._generate_service_file(
-            cli_path="/usr/bin/clamui-scheduled-scan",
+            cli_command=["/usr/bin/clamui-scheduled-scan"],
             targets=["/home/user/Downloads"],
             skip_on_battery=False,
             auto_quarantine=True,
@@ -408,7 +409,7 @@ class TestSchedulerServiceFiles:
     def test_generate_service_file_multiple_targets(self, scheduler):
         """Test service file generation with multiple targets."""
         service = scheduler._generate_service_file(
-            cli_path="/usr/bin/clamui-scheduled-scan",
+            cli_command=["/usr/bin/clamui-scheduled-scan"],
             targets=["/home/user/Documents", "/home/user/Downloads"],
             skip_on_battery=True,
             auto_quarantine=True,
@@ -432,7 +433,7 @@ class TestSchedulerServiceFiles:
     def test_generate_service_file_special_chars_quoted(self, scheduler):
         """Test service file properly quotes paths with special characters."""
         service = scheduler._generate_service_file(
-            cli_path="/usr/bin/clamui-scheduled-scan",
+            cli_command=["/usr/bin/clamui-scheduled-scan"],
             targets=["/home/user/My Documents", "/path/with'quotes"],
             skip_on_battery=True,
             auto_quarantine=False,
@@ -580,7 +581,7 @@ class TestSchedulerSystemdIntegration:
             mock.patch.object(
                 scheduler,
                 "_get_cli_command_path",
-                return_value="/usr/bin/clamui-scheduled-scan",
+                return_value=["/usr/bin/clamui-scheduled-scan"],
             ),
             mock.patch("subprocess.run") as mock_run,
         ):
@@ -626,6 +627,116 @@ class TestSchedulerCronIntegration:
         entry = scheduler._generate_crontab_entry(ScheduleFrequency.WEEKLY, "14:30", day_of_week=2)
         # Wednesday is 2 in our format, 3 in cron format
         assert entry == "30 14 * * 3"
+
+
+class TestSchedulerCronMarkerSubstring:
+    """Regression tests for BUG-004 — substring-match crontab marker.
+
+    Prior behavior used ``self.CRON_MARKER in line`` which silently dropped
+    any user crontab line that merely contained the marker as a substring,
+    plus the next user line. These tests pin the anchored-equality behavior
+    plus the next-line safety check.
+    """
+
+    @pytest.fixture
+    def scheduler(self):
+        """Create a Scheduler with cron backend forced (no real cron needed)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sched = Scheduler(config_dir=Path(tmpdir))
+            sched._backend = SchedulerBackend.CRON
+            yield sched
+
+    def _run_disable_with_crontab(self, scheduler, crontab_content):
+        """Helper: run _disable_cron_schedule with a fake `crontab -l` output.
+
+        Returns the new crontab content that would have been written, by
+        capturing the `input=` kwarg of the second subprocess.run call.
+        """
+        captured = {"new_crontab": None}
+
+        def fake_run(cmd, *args, **kwargs):
+            # First call is `crontab -l`, second is `crontab -` (write).
+            cmd_str = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
+            if "-l" in cmd_str:
+                return mock.MagicMock(returncode=0, stdout=crontab_content, stderr="")
+            elif kwargs.get("input") is not None:
+                captured["new_crontab"] = kwargs["input"]
+                return mock.MagicMock(returncode=0, stdout="", stderr="")
+            else:
+                # `crontab -r` (remove all)
+                captured["new_crontab"] = ""
+                return mock.MagicMock(returncode=0, stdout="", stderr="")
+
+        with mock.patch("src.core.scheduler.subprocess.run", side_effect=fake_run):
+            success, _err = scheduler._disable_cron_schedule()
+
+        return success, captured["new_crontab"]
+
+    def test_disable_does_not_drop_user_line_after_marker_substring(self, scheduler):
+        """A user comment containing the marker as a substring must not consume the next line."""
+        # Choose a comment whose text fully contains the literal marker as a substring.
+        marker = scheduler.CRON_MARKER  # "# ClamUI Scheduled Scan"
+        user_comment = f"{marker} (legacy backup notes — keep below)"
+        user_job = "0 5 * * * /usr/bin/important-user-job"
+        crontab = f"{user_comment}\n{user_job}\n"
+
+        success, new_crontab = self._run_disable_with_crontab(scheduler, crontab)
+
+        assert success is True
+        # The user comment must remain. Even more importantly, the user job
+        # below it must NOT have been silently dropped.
+        assert user_job in new_crontab, (
+            f"User job was silently dropped! new_crontab={new_crontab!r}"
+        )
+        assert user_comment in new_crontab
+
+    def test_disable_anchored_marker_removes_only_clamui_block(self, scheduler):
+        """Exact marker line followed by a clamscan command should remove both."""
+        marker = scheduler.CRON_MARKER  # "# ClamUI Scheduled Scan"
+        clamui_cmd = "0 2 * * * /usr/bin/clamui-scheduled-scan --target /home"
+        user_job = "30 4 * * * /usr/bin/backup.sh"
+        crontab = f"{user_job}\n{marker}\n{clamui_cmd}\n"
+
+        success, new_crontab = self._run_disable_with_crontab(scheduler, crontab)
+
+        assert success is True
+        assert marker not in new_crontab
+        assert clamui_cmd not in new_crontab
+        # Unrelated user job must be preserved.
+        assert user_job in new_crontab
+
+    def test_disable_does_not_drop_after_marker_if_next_line_not_clamui(self, scheduler):
+        """Defensive check: marker followed by a non-ClamUI line should NOT drop the next line.
+
+        This is the safety net for the case where the marker exists but the
+        following line was clobbered by a user. We should drop the marker
+        (it's anchored equality) but keep the unrelated user line.
+        """
+        marker = scheduler.CRON_MARKER
+        non_clamui_line = "30 6 * * * /usr/bin/totally-unrelated --user-job"
+        crontab = f"{marker}\n{non_clamui_line}\n"
+
+        success, new_crontab = self._run_disable_with_crontab(scheduler, crontab)
+
+        assert success is True
+        # Marker line itself is removed.
+        assert marker not in new_crontab
+        # User line below the marker must NOT be dropped — it's clearly not
+        # a ClamUI command.
+        assert non_clamui_line in new_crontab
+
+    def test_disable_handles_marker_with_whitespace(self, scheduler):
+        """Anchored equality check uses .strip() so leading/trailing whitespace is tolerated."""
+        marker = scheduler.CRON_MARKER
+        clamui_cmd = "0 2 * * * /usr/bin/clamui-scheduled-scan"
+        # Marker line has trailing whitespace.
+        crontab = f"{marker}   \n{clamui_cmd}\n"
+
+        success, new_crontab = self._run_disable_with_crontab(scheduler, crontab)
+
+        assert success is True
+        assert clamui_cmd not in new_crontab
+        assert marker not in new_crontab
 
 
 class TestGetVenvPaths:
@@ -774,7 +885,7 @@ class TestGetCliCommandPath:
 
                 result = scheduler._get_cli_command_path()
 
-                assert result == "/usr/bin/clamui-scheduled-scan"
+                assert result == ["/usr/bin/clamui-scheduled-scan"]
                 mock_which.assert_called_with("clamui-scheduled-scan")
 
     def test_returns_venv_path_when_exists(self, scheduler):
@@ -796,7 +907,7 @@ class TestGetCliCommandPath:
                     with mock.patch("src.core.scheduler.is_flatpak", return_value=False):
                         result = scheduler._get_cli_command_path()
 
-                        assert result == str(cli_script)
+                        assert result == [str(cli_script)]
 
     def test_returns_module_execution_with_venv_python(self, scheduler):
         """Test falls back to module execution when only venv Python exists."""
@@ -817,8 +928,7 @@ class TestGetCliCommandPath:
                     with mock.patch("src.core.scheduler.is_flatpak", return_value=False):
                         result = scheduler._get_cli_command_path()
 
-                        assert str(python_bin) in result
-                        assert "-m src.cli.scheduled_scan" in result
+                        assert result == [str(python_bin), "-m", "src.cli.scheduled_scan"]
 
     def test_correct_module_path_in_fallback(self, scheduler):
         """Test that fallback uses correct module path src.cli.scheduled_scan."""
@@ -832,12 +942,10 @@ class TestGetCliCommandPath:
                     with mock.patch.object(scheduler, "_check_path_exists", return_value=False):
                         result = scheduler._get_cli_command_path()
 
-                        # Should use correct module path
+                        # Should use correct module path (exact token)
                         assert "src.cli.scheduled_scan" in result
                         # Should NOT use the old buggy path
-                        assert (
-                            "src.scheduled_scan" not in result or "src.cli.scheduled_scan" in result
-                        )
+                        assert "src.scheduled_scan" not in result
 
     def test_prefers_entry_point_over_module(self, scheduler):
         """Test that entry point script is preferred over module execution."""
@@ -862,7 +970,7 @@ class TestGetCliCommandPath:
                         result = scheduler._get_cli_command_path()
 
                     # Should return entry point, not module execution
-                    assert result == str(cli_script)
+                    assert result == [str(cli_script)]
                     assert "-m" not in result
 
     def test_returns_none_when_nothing_found(self, scheduler):
@@ -880,11 +988,13 @@ class TestGetCliCommandPath:
             with mock.patch.dict("os.environ", {"FLATPAK_ID": "io.github.linx_systems.ClamUI"}):
                 result = scheduler._get_cli_command_path()
 
-                # Should return flatpak run command with --command= syntax
-                assert (
-                    result
-                    == "flatpak run --command=clamui-scheduled-scan io.github.linx_systems.ClamUI"
-                )
+                # Should return flatpak run command tokens with --command= syntax
+                assert result == [
+                    "flatpak",
+                    "run",
+                    "--command=clamui-scheduled-scan",
+                    "io.github.linx_systems.ClamUI",
+                ]
 
     def test_flatpak_uses_default_app_id_if_not_in_env(self, scheduler):
         """Test that Flatpak mode uses default app ID if FLATPAK_ID not set."""
@@ -895,7 +1005,383 @@ class TestGetCliCommandPath:
                 result = scheduler._get_cli_command_path()
 
                 # Should use default app ID with --command= syntax
-                assert (
-                    result
-                    == "flatpak run --command=clamui-scheduled-scan io.github.linx_systems.ClamUI"
+                assert result == [
+                    "flatpak",
+                    "run",
+                    "--command=clamui-scheduled-scan",
+                    "io.github.linx_systems.ClamUI",
+                ]
+
+
+class TestSchedulerMultiTokenAndPercentEscaping:
+    """Regression tests for multi-token CLI commands and '%' escaping.
+
+    - A multi-token cli_path (Flatpak / module-exec forms) must be emitted as
+      separate program args, not wrapped in a single shlex.quote() blob that
+      systemd/cron would treat as one non-executable program token.
+    - A literal '%' in a target path must be escaped per-backend: '%%' for
+      systemd specifiers, '\\%' for cron.
+    """
+
+    @pytest.fixture
+    def scheduler(self):
+        """Create a Scheduler instance."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Scheduler(config_dir=Path(tmpdir))
+
+    def _capture_cron_entry(self, scheduler, targets, skip_on_battery=False, auto_quarantine=False):
+        """Run _enable_cron_schedule with mocked crontab subprocess calls.
+
+        Returns the cron command line that would have been written (the line
+        following the CRON_MARKER in the new crontab).
+        """
+        captured = {"new_crontab": None}
+
+        def fake_run(cmd, *args, **kwargs):
+            # First call is `crontab -l`, second is `crontab -` (write).
+            cmd_str = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
+            if "-l" in cmd_str:
+                return mock.MagicMock(returncode=0, stdout="", stderr="")
+            captured["new_crontab"] = kwargs.get("input", "")
+            return mock.MagicMock(returncode=0, stdout="", stderr="")
+
+        with mock.patch("src.core.scheduler.subprocess.run", side_effect=fake_run):
+            success, _err = scheduler._enable_cron_schedule(
+                ScheduleFrequency.DAILY,
+                "02:00",
+                targets,
+                0,
+                1,
+                skip_on_battery,
+                auto_quarantine,
+            )
+
+        assert success is True
+        # The cron command line is the last line of the new crontab (after marker).
+        return captured["new_crontab"].splitlines()[-1]
+
+    def test_systemd_multitoken_cli_emitted_as_separate_args(self, scheduler):
+        """Multi-token cli command must not be wrapped as one quoted ExecStart blob."""
+        cli_command = ["flatpak", "run", "--command=clamui-scheduled-scan", "org.x.App"]
+        service = scheduler._generate_service_file(
+            cli_command=cli_command,
+            targets=["/home/user/Documents"],
+            skip_on_battery=False,
+            auto_quarantine=False,
+        )
+
+        # Tokens appear as separate args, executable as-is.
+        assert "ExecStart=flatpak run --command=clamui-scheduled-scan org.x.App" in service
+        # The buggy single-token quoting would emit the whole command quoted.
+        assert f"'{' '.join(cli_command)}'" not in service
+
+    def test_cron_multitoken_cli_emitted_as_separate_args(self, scheduler):
+        """Multi-token cli command must not be wrapped as one quoted cron command blob."""
+        cli_command = ["flatpak", "run", "--command=clamui-scheduled-scan", "org.x.App"]
+        with mock.patch.object(scheduler, "_get_cli_command_path", return_value=cli_command):
+            cron_line = self._capture_cron_entry(scheduler, ["/home/user/Documents"])
+
+        assert "flatpak run --command=clamui-scheduled-scan org.x.App" in cron_line
+        assert f"'{' '.join(cli_command)}'" not in cron_line
+
+    def test_systemd_escapes_literal_percent_in_target(self, scheduler):
+        """A '%' in a target path must be doubled to '%%' for systemd specifiers."""
+        service = scheduler._generate_service_file(
+            cli_command=["/usr/bin/clamui-scheduled-scan"],
+            targets=["/home/user/50%off"],
+            skip_on_battery=False,
+            auto_quarantine=False,
+        )
+
+        assert "--target /home/user/50%%off" in service
+        # No lone, unescaped '%' specifier survives.
+        assert "/home/user/50%off" not in service
+
+    def test_cron_escapes_literal_percent_in_target(self, scheduler):
+        """A '%' in a target path must be backslash-escaped for cron."""
+        with mock.patch.object(
+            scheduler, "_get_cli_command_path", return_value=["/usr/bin/clamui-scheduled-scan"]
+        ):
+            cron_line = self._capture_cron_entry(scheduler, ["/home/user/50%off"])
+
+        assert "--target /home/user/50\\%off" in cron_line
+        assert "/home/user/50%off" not in cron_line
+
+    def test_systemd_escapes_dollar_in_target(self, scheduler):
+        """A '${VAR}' in a target path must be escaped to '$$' for systemd.
+
+        systemd expands environment variables in ExecStart even inside single
+        quotes, so shlex.quote() alone does not protect a path; an unescaped
+        '${HOME}' would be silently rewritten to a wrong/empty path at scan
+        time.  The documented literal-dollar escape is '$$'.
+        """
+        service = scheduler._generate_service_file(
+            cli_command=["/usr/bin/clamui-scheduled-scan"],
+            targets=["/home/user/${HOME}/x"],
+            skip_on_battery=False,
+            auto_quarantine=False,
+        )
+
+        exec_line = next(line for line in service.splitlines() if line.startswith("ExecStart="))
+        # Escaped form is present...
+        assert "/home/user/$${HOME}/x" in exec_line
+        # ...and no lone (unescaped) dollar survives: every '$' is part of '$$'.
+        assert "$" not in exec_line.replace("$$", "")
+
+    def test_systemd_escapes_standalone_dollar_var_target(self, scheduler):
+        """A target that is exactly '$VAR' must also be neutralized."""
+        service = scheduler._generate_service_file(
+            cli_command=["/usr/bin/clamui-scheduled-scan"],
+            targets=["$HOME"],
+            skip_on_battery=False,
+            auto_quarantine=False,
+        )
+
+        exec_line = next(line for line in service.splitlines() if line.startswith("ExecStart="))
+        assert "$$HOME" in exec_line
+        assert "$" not in exec_line.replace("$$", "")
+
+    def test_cron_does_not_double_dollar_in_target(self, scheduler):
+        """cron runs via /bin/sh, which suppresses '$' inside single quotes.
+
+        The systemd '$$' escape must therefore NOT leak into the cron path,
+        or the literal '$$' would reach the shell verbatim.
+        """
+        with mock.patch.object(
+            scheduler, "_get_cli_command_path", return_value=["/usr/bin/clamui-scheduled-scan"]
+        ):
+            cron_line = self._capture_cron_entry(scheduler, ["/home/user/${HOME}/x"])
+
+        assert "/home/user/${HOME}/x" in cron_line
+        assert "$$" not in cron_line
+
+
+class TestSchedulerCliCommandTokenization:
+    """Regression tests for issue #150 residuals — flat-string command re-splitting.
+
+    _get_cli_command_path() now returns argv tokens (list[str]); consumers must
+    quote each token verbatim and never shlex.split() a flat command string.
+    Previously a single executable path containing a space was re-split into
+    two tokens (ExecStart exec'd '/home/user' -> silent 203/EXEC) and a path
+    containing a quote raised shlex "No closing quotation".
+    """
+
+    @pytest.fixture
+    def scheduler(self):
+        """Create a Scheduler instance."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Scheduler(config_dir=Path(tmpdir))
+
+    @staticmethod
+    def _exec_start_words(service):
+        """Shell-parse the ExecStart line of a service file into words."""
+        exec_line = next(line for line in service.splitlines() if line.startswith("ExecStart="))
+        return shlex.split(exec_line[len("ExecStart=") :])
+
+    def _capture_cron_command(self, scheduler, cli_command, targets):
+        """Run _enable_cron_schedule with mocked crontab subprocess calls.
+
+        Returns the shell command portion (after the five time fields) of the
+        cron entry that would have been written.
+        """
+        captured = {"new_crontab": None}
+
+        def fake_run(cmd, *args, **kwargs):
+            # First call is `crontab -l`, second is `crontab -` (write).
+            cmd_str = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
+            if "-l" in cmd_str:
+                return mock.MagicMock(returncode=0, stdout="", stderr="")
+            captured["new_crontab"] = kwargs.get("input", "")
+            return mock.MagicMock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(scheduler, "_get_cli_command_path", return_value=cli_command):
+            with mock.patch("src.core.scheduler.subprocess.run", side_effect=fake_run):
+                success, err = scheduler._enable_cron_schedule(
+                    ScheduleFrequency.DAILY, "02:00", targets, 0, 1, False, False
                 )
+
+        assert success is True, err
+        cron_line = captured["new_crontab"].splitlines()[-1]
+        return cron_line.split(" ", 5)[5]
+
+    def test_systemd_cli_path_with_space_roundtrips(self, scheduler):
+        """A venv path containing a space must stay one argv[0] word (issue #150)."""
+        cli = "/home/user name/.local/share/clamui/venv/bin/clamui-scheduled-scan"
+        service = scheduler._generate_service_file(
+            cli_command=[cli],
+            targets=["/home/user name/Documents"],
+            skip_on_battery=False,
+            auto_quarantine=False,
+        )
+
+        words = self._exec_start_words(service)
+        # First shell-parsed word is the full path, not '/home/user'.
+        assert words[0] == cli
+        assert words[1:] == ["--target", "/home/user name/Documents"]
+
+    def test_systemd_cli_path_with_quote_roundtrips(self, scheduler):
+        """A path containing a single quote must not raise 'No closing quotation'."""
+        cli = "/home/user's files/venv/bin/clamui-scheduled-scan"
+        service = scheduler._generate_service_file(
+            cli_command=[cli],
+            targets=["/home/user/Documents"],
+            skip_on_battery=False,
+            auto_quarantine=False,
+        )
+
+        assert self._exec_start_words(service)[0] == cli
+
+    def test_enable_systemd_with_quote_in_cli_path_succeeds(self, scheduler):
+        """Enabling must not surface 'Error enabling schedule: No closing quotation'."""
+        cli = "/home/user's files/venv/bin/clamui-scheduled-scan"
+        with (
+            mock.patch.object(scheduler, "_get_cli_command_path", return_value=[cli]),
+            mock.patch("src.core.scheduler.subprocess.run") as mock_run,
+        ):
+            mock_run.return_value = mock.MagicMock(returncode=0, stdout="", stderr="")
+            success, error = scheduler._enable_systemd_schedule(
+                ScheduleFrequency.DAILY, "02:00", ["/home/user/Documents"], 0, 1, False, False
+            )
+
+        assert success is True
+        assert error is None
+        service = (scheduler._systemd_dir / f"{scheduler.SERVICE_NAME}.service").read_text()
+        assert self._exec_start_words(service)[0] == cli
+
+    def test_systemd_dollar_in_executable_not_doubled_but_target_is(self, scheduler):
+        """'$'->'$$' escaping applies to arguments only, never argv[0].
+
+        systemd does not variable-expand the executable word, so doubling a
+        literal '$' there would corrupt the path to '$$'.  Targets must still
+        be escaped since systemd expands '${VAR}' in arguments.
+        """
+        cli = "/opt/apps/$pecial/bin/clamui-scheduled-scan"
+        service = scheduler._generate_service_file(
+            cli_command=[cli],
+            targets=["/data/${HOME}/x"],
+            skip_on_battery=False,
+            auto_quarantine=False,
+        )
+
+        exec_line = next(line for line in service.splitlines() if line.startswith("ExecStart="))
+        # Executable keeps its single '$'...
+        assert "$$pecial" not in exec_line
+        assert self._exec_start_words(service)[0] == cli
+        # ...while the target's '$' is still doubled.
+        assert "/data/$${HOME}/x" in exec_line
+
+    def test_cron_cli_path_with_space_roundtrips(self, scheduler):
+        """A venv path containing a space must stay one command word in cron."""
+        cli = "/home/user name/.local/share/clamui/venv/bin/clamui-scheduled-scan"
+        cron_cmd = self._capture_cron_command(scheduler, [cli], ["/home/user name/Documents"])
+
+        words = shlex.split(cron_cmd)
+        assert words[0] == cli
+        assert words[1:] == ["--target", "/home/user name/Documents"]
+
+    def test_cron_cli_path_with_quote_roundtrips(self, scheduler):
+        """A path containing a single quote must not error in the cron path."""
+        cli = "/home/user's files/venv/bin/clamui-scheduled-scan"
+        cron_cmd = self._capture_cron_command(scheduler, [cli], ["/home/user/Documents"])
+
+        assert shlex.split(cron_cmd)[0] == cli
+
+    def test_cron_dollar_in_executable_stays_single(self, scheduler):
+        """The systemd '$$' escape must never touch the cron executable word."""
+        cli = "/opt/apps/$pecial/bin/clamui-scheduled-scan"
+        cron_cmd = self._capture_cron_command(scheduler, [cli], ["/home/user/Documents"])
+
+        assert "$$" not in cron_cmd
+        assert shlex.split(cron_cmd)[0] == cli
+
+    def test_flatpak_tokens_render_issue_150_execstart(self, scheduler):
+        """The Flatpak token list must render the exact working ExecStart (issue #150)."""
+        with mock.patch("src.core.scheduler.is_flatpak", return_value=True):
+            with mock.patch.dict("os.environ", {"FLATPAK_ID": "io.github.linx_systems.ClamUI"}):
+                tokens = scheduler._get_cli_command_path()
+
+        service = scheduler._generate_service_file(
+            cli_command=tokens,
+            targets=["/home/user/Documents"],
+            skip_on_battery=True,
+            auto_quarantine=False,
+        )
+
+        assert (
+            "ExecStart=flatpak run --command=clamui-scheduled-scan "
+            "io.github.linx_systems.ClamUI --skip-on-battery "
+            "--target /home/user/Documents" in service
+        )
+
+
+class TestSchedulerCleanEnv:
+    """systemctl/crontab subprocess calls must run with get_clean_env().
+
+    AppImage runtime variables (LD_LIBRARY_PATH, PYTHONHOME, ...) must not
+    leak into host helpers, matching the convention of sibling core modules
+    (see GitHub issue #155 and src.core.flatpak.get_clean_env).
+    """
+
+    @pytest.fixture
+    def scheduler(self):
+        """Create a Scheduler instance."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Scheduler(config_dir=Path(tmpdir))
+
+    def test_systemd_enable_uses_clean_env(self, scheduler):
+        """daemon-reload and enable --now must pass env=get_clean_env()."""
+        with (
+            mock.patch.object(
+                scheduler,
+                "_get_cli_command_path",
+                return_value=["/usr/bin/clamui-scheduled-scan"],
+            ),
+            mock.patch("src.core.scheduler.get_clean_env", return_value={"CLEAN": "1"}),
+            mock.patch("src.core.scheduler.subprocess.run") as mock_run,
+        ):
+            mock_run.return_value = mock.MagicMock(returncode=0, stdout="", stderr="")
+            success, _err = scheduler._enable_systemd_schedule(
+                ScheduleFrequency.DAILY, "02:00", ["/tmp/x"], 0, 1, False, False
+            )
+
+        assert success is True
+        assert len(mock_run.call_args_list) == 2  # daemon-reload, enable --now
+        for call in mock_run.call_args_list:
+            assert call.kwargs.get("env") == {"CLEAN": "1"}
+
+    def test_cron_enable_uses_clean_env(self, scheduler):
+        """crontab -l and crontab - must pass env=get_clean_env()."""
+        with (
+            mock.patch.object(
+                scheduler,
+                "_get_cli_command_path",
+                return_value=["/usr/bin/clamui-scheduled-scan"],
+            ),
+            mock.patch("src.core.scheduler.get_clean_env", return_value={"CLEAN": "1"}),
+            mock.patch("src.core.scheduler.subprocess.run") as mock_run,
+        ):
+            mock_run.return_value = mock.MagicMock(returncode=0, stdout="", stderr="")
+            success, _err = scheduler._enable_cron_schedule(
+                ScheduleFrequency.DAILY, "02:00", ["/tmp/x"], 0, 1, False, False
+            )
+
+        assert success is True
+        assert len(mock_run.call_args_list) == 2  # crontab -l, crontab -
+        for call in mock_run.call_args_list:
+            assert call.kwargs.get("env") == {"CLEAN": "1"}
+
+    def test_cron_disable_uses_clean_env(self, scheduler):
+        """crontab -l and the rewrite/removal must pass env=get_clean_env()."""
+        marker = scheduler.CRON_MARKER
+        crontab = f"{marker}\n0 2 * * * /usr/bin/clamui-scheduled-scan --target /home\n"
+        with (
+            mock.patch("src.core.scheduler.get_clean_env", return_value={"CLEAN": "1"}),
+            mock.patch("src.core.scheduler.subprocess.run") as mock_run,
+        ):
+            mock_run.return_value = mock.MagicMock(returncode=0, stdout=crontab, stderr="")
+            success, _err = scheduler._disable_cron_schedule()
+
+        assert success is True
+        assert len(mock_run.call_args_list) == 2  # crontab -l, crontab -r (empty)
+        for call in mock_run.call_args_list:
+            assert call.kwargs.get("env") == {"CLEAN": "1"}

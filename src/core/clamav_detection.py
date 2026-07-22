@@ -12,9 +12,9 @@ This module provides functions for:
 import logging
 import os
 import subprocess
+from pathlib import Path
 
 from .flatpak import (
-    ensure_freshclam_config,
     get_clean_env,
     is_flatpak,
     which_host_command,
@@ -26,6 +26,36 @@ logger = logging.getLogger(__name__)
 
 # Database file extensions that ClamAV uses
 _DATABASE_EXTENSIONS = {".cvd", ".cld", ".cud"}
+_DEFAULT_DATABASE_DIRS = ("/var/lib/clamav", "/usr/local/share/clamav")
+
+
+def systemd_unit_exists(unit_name: str) -> bool:
+    """
+    Check whether a systemd unit is actually known to systemd.
+
+    `systemctl is-active` prints "inactive" for units systemd has never
+    heard of, so callers probing multiple candidate unit names cannot use
+    its output alone to distinguish "installed but stopped" from
+    "not installed". LoadState is "loaded" only for real units.
+
+    Args:
+        unit_name: Full unit name (e.g. "clamav-freshclam.service")
+
+    Returns:
+        True if systemd reports the unit as loaded, False otherwise
+    """
+    try:
+        result = subprocess.run(
+            wrap_host_command(["systemctl", "show", "-p", "LoadState", "--value", unit_name]),
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=get_clean_env(),
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        logger.debug("systemctl show failed for %s", unit_name, exc_info=True)
+        return False
+    return result.returncode == 0 and result.stdout.strip() == "loaded"
 
 
 def check_clamav_installed() -> tuple[bool, str | None]:
@@ -95,20 +125,7 @@ def check_freshclam_installed() -> tuple[bool, str | None]:
             ),
         )
 
-    # Flatpak freshclam.conf Generation Logic:
-    # Why: Flatpak bundles freshclam but it requires a config file even for --version
-    # What: ensure_freshclam_config() creates ~/.var/app/io.github.linx_systems.ClamUI/config/clamui/freshclam.conf
-    # Config specifies:
-    #   - DatabaseDirectory: writable location inside Flatpak sandbox
-    #   - DatabaseMirror: database.clamav.net (official mirror)
-    # Why needed: System /etc/clamav/freshclam.conf is not accessible in Flatpak sandbox
-    # Fallback: If config generation fails, freshclam will fail to run (expected behavior)
-    # Build command - in Flatpak, bundled freshclam needs config file even for --version
     cmd = ["freshclam", "--version"]
-    if is_flatpak():
-        config_path = ensure_freshclam_config()
-        if config_path is not None and config_path.exists():
-            cmd = ["freshclam", "--config-file", str(config_path), "--version"]
 
     # Try to get version to verify it's working
     try:
@@ -160,8 +177,7 @@ def check_clamdscan_installed() -> tuple[bool, str | None]:
         )
 
     # Try to get version to verify it's working
-    # Use force_host=True because clamdscan must communicate with the HOST's clamd
-    # daemon. The bundled clamdscan in Flatpak can't talk to the host daemon.
+    # Use force_host=True because clamdscan must communicate with the host clamd daemon.
     try:
         result = subprocess.run(
             wrap_host_command(["clamdscan", "--version"], force_host=True),
@@ -289,8 +305,8 @@ def check_clamd_connection(
         resolved_config_path = detect_clamd_conf_path()
 
     # Try to ping the daemon (--ping requires a timeout argument in seconds)
-    # Use force_host=True because the clamd daemon runs on the HOST, not in the
-    # Flatpak sandbox. The bundled clamdscan can't communicate with the host daemon.
+    # Use force_host=True because the clamd daemon runs on the host, not in the
+    # Flatpak sandbox.
     try:
         cmd = ["clamdscan"]
         if resolved_config_path:
@@ -348,6 +364,108 @@ def get_freshclam_path() -> str | None:
     return which_host_command("freshclam")
 
 
+def _path_contains_database_file(db_dir: Path) -> tuple[bool, str | None]:
+    """Check a directly accessible database directory for ClamAV database files."""
+    if not db_dir.exists():
+        return (False, _("Database directory does not exist: {path}").format(path=db_dir))
+
+    try:
+        for file in db_dir.iterdir():
+            if file.suffix.lower() in _DATABASE_EXTENSIONS:
+                return (True, None)
+    except PermissionError:
+        return (False, _("Permission denied accessing: {path}").format(path=db_dir))
+    except OSError as e:
+        return (False, _("Error accessing database: {error}").format(error=e))
+
+    return (False, _("No virus database files found. Please download the database first."))
+
+
+def _host_path_contains_database_file(db_dir: str) -> tuple[bool, str | None]:
+    """Check a host database directory from inside Flatpak."""
+    try:
+        result = subprocess.run(
+            [
+                "flatpak-spawn",
+                "--host",
+                "find",
+                db_dir,
+                "-maxdepth",
+                "1",
+                "-type",
+                "f",
+                "(",
+                "-iname",
+                "*.cvd",
+                "-o",
+                "-iname",
+                "*.cld",
+                "-o",
+                "-iname",
+                "*.cud",
+                ")",
+                "-print",
+                "-quit",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except subprocess.TimeoutExpired:
+        return (False, _("Timed out checking host database directory: {path}").format(path=db_dir))
+    except FileNotFoundError:
+        return (False, _("flatpak-spawn not available"))
+    except OSError as e:
+        return (False, _("Error checking host database directory: {error}").format(error=e))
+
+    if result.returncode != 0:
+        error = result.stderr.strip() or result.stdout.strip()
+        return (
+            False,
+            _("Error accessing host database directory {path}: {error}").format(
+                path=db_dir, error=error
+            ),
+        )
+
+    if result.stdout.strip():
+        return (True, None)
+
+    return (False, _("No virus database files found in host directory: {path}").format(path=db_dir))
+
+
+def _detect_database_dirs_from_host_freshclam_config() -> list[str]:
+    """Read DatabaseDirectory values from the host freshclam config when available."""
+    config_path = resolve_freshclam_conf_path()
+    if not config_path:
+        return []
+
+    try:
+        from .clamav_config import parse_config
+
+        config, error = parse_config(config_path)
+        if config is None:
+            if error:
+                logger.debug("Failed to parse freshclam config %s: %s", config_path, error)
+            return []
+
+        database_dir = config.get_value("DatabaseDirectory")
+        if database_dir:
+            return [database_dir.strip()]
+    except Exception as e:
+        logger.debug("Failed to read DatabaseDirectory from %s: %s", config_path, e)
+
+    return []
+
+
+def _host_database_dirs_to_check() -> list[str]:
+    """Return host ClamAV database directories in priority order."""
+    dirs: list[str] = []
+    for db_dir in [*_detect_database_dirs_from_host_freshclam_config(), *_DEFAULT_DATABASE_DIRS]:
+        if db_dir and db_dir not in dirs:
+            dirs.append(db_dir)
+    return dirs
+
+
 def check_database_available() -> tuple[bool, str | None]:
     """
     Check if ClamAV virus database files are available.
@@ -360,34 +478,23 @@ def check_database_available() -> tuple[bool, str | None]:
         - (True, None) if database files exist
         - (False, error_message) if no database files found
     """
-    from pathlib import Path
-
-    from .flatpak import get_clamav_database_dir
-
-    # Determine database directory based on environment
     if is_flatpak():
-        db_dir_path = get_clamav_database_dir()
-        if db_dir_path is None:
-            return (False, _("Could not determine Flatpak database directory"))
-        db_dir = db_dir_path
-    else:
-        db_dir = Path("/var/lib/clamav")
-
-    # Check if directory exists
-    if not db_dir.exists():
-        return (False, _("Database directory does not exist: {path}").format(path=db_dir))
-
-    # Check for database files with valid extensions
-    try:
-        for file in db_dir.iterdir():
-            if file.suffix.lower() in _DATABASE_EXTENSIONS:
+        errors = []
+        for db_dir in _host_database_dirs_to_check():
+            available, error = _host_path_contains_database_file(db_dir)
+            if available:
                 return (True, None)
-    except PermissionError:
-        return (False, _("Permission denied accessing: {path}").format(path=db_dir))
-    except OSError as e:
-        return (False, _("Error accessing database: {error}").format(error=e))
+            if error:
+                errors.append(error)
+        detail = "; ".join(errors) if errors else _("No host database directories were found")
+        return (
+            False,
+            _(
+                "No host ClamAV virus database files found. Update the host database with freshclam. Details: {detail}"
+            ).format(detail=detail),
+        )
 
-    return (False, _("No virus database files found. Please download the database first."))
+    return _path_contains_database_file(Path("/var/lib/clamav"))
 
 
 # --- Config file path detection ---

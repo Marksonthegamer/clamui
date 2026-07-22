@@ -5,9 +5,7 @@ Scan interface component for ClamUI with folder picker, scan button, and results
 
 import logging
 import os
-import tempfile
 import time
-from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -19,6 +17,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
 from ..core.i18n import _, ngettext
 from ..core.quarantine import QuarantineManager
+from ..core.result_formatters import clean_scan_status_message, compose_scan_warning
 from ..core.scanner import Scanner, ScanProgress, ScanResult, ScanStatus
 from ..core.utils import (
     format_scan_path,
@@ -26,7 +25,15 @@ from ..core.utils import (
     validate_dropped_files,
 )
 from .clipboard_helper import ClipboardHelper
-from .compat import create_banner, open_paths_dialog
+from .compat import create_banner, open_paths_dialog, safe_set_subtitle_lines
+from .eicar_helper import (
+    EICAR_TEST_STRING as _EICAR_HELPER_STRING,
+)
+from .eicar_helper import (
+    cleanup_eicar_path,
+    create_eicar_temp,
+    register_eicar_atexit_cleanup,
+)
 from .fullscreen_dialog import FullscreenLogDialog
 from .profile_dialogs import ProfileListDialog
 from .scan_results_dialog import ScanResultsDialog
@@ -48,9 +55,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# EICAR test string - industry-standard antivirus test pattern
-# This is NOT malware - it's a safe test string recognized by all AV software
-EICAR_TEST_STRING = r"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
+# EICAR test string - industry-standard antivirus test pattern.
+# Re-exported from eicar_helper so existing imports keep working.
+EICAR_TEST_STRING = _EICAR_HELPER_STRING
 STATUS_DETAIL_SUMMARY_MAX_CHARS = 160
 STATUS_DETAIL_MIN_HEIGHT = 120
 STATUS_DETAIL_MAX_HEIGHT = 260
@@ -106,6 +113,10 @@ class ScanView(Gtk.Box):
 
         # Temp file path for EICAR test (for cleanup)
         self._eicar_temp_path: str = ""
+        # atexit unregister handle for the EICAR cleanup safety net.
+        # Replaced with a real unregister callable when the EICAR temp file
+        # is created; reset to a no-op once it has been cleaned up.
+        self._eicar_atexit_unregister = lambda: None
         # Optional one-shot backend override for the current scan session.
         self._scan_backend_override: str | None = None
         # Optional one-shot daemon mode override for the current scan session.
@@ -1299,7 +1310,7 @@ class ScanView(Gtk.Box):
         self._current_file_row = Adw.ActionRow()
         self._current_file_row.set_title(_("Currently scanning"))
         self._current_file_row.set_subtitle(_("Waiting for scan data..."))
-        self._current_file_row.set_subtitle_lines(1)
+        safe_set_subtitle_lines(self._current_file_row, 1)
         # Spinner prefix
         self._file_spinner = Gtk.Spinner()
         self._file_spinner.set_spinning(True)
@@ -1377,6 +1388,18 @@ class ScanView(Gtk.Box):
         if self._threat_group is not None:
             self._threat_group.set_visible(False)
         self._live_threat_count = 0
+
+    def do_unmap(self):
+        """
+        Handle widget unmapping (being hidden or removed from the widget tree).
+
+        Cleans up any active GLib timeout sources to prevent callbacks from
+        firing on a destroyed widget.
+        """
+        if self._pulse_timeout_id is not None:
+            GLib.source_remove(self._pulse_timeout_id)
+            self._pulse_timeout_id = None
+        Gtk.Box.do_unmap(self)
 
     def _on_parent_changed(self, widget, pspec):
         """
@@ -1816,15 +1839,14 @@ class ScanView(Gtk.Box):
                 temp_dir = str(cache_dir)
             else:
                 temp_dir = None  # Use system default
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                suffix=".txt",
-                prefix="eicar_test_",
-                delete=False,
-                dir=temp_dir,
-            ) as f:
-                f.write(EICAR_TEST_STRING)
-                self._eicar_temp_path = f.name
+            self._eicar_temp_path = create_eicar_temp(parent_dir=temp_dir)
+            # Belt-and-braces cleanup: if the app is force-quit / crashes mid-
+            # scan, the normal _on_scan_complete cleanup never runs and the
+            # EICAR file lingers — the next scan of that directory then flags
+            # it as a real threat (UI-010). Register an atexit handler as a
+            # safety net; the unregister handle is invoked on the happy path
+            # to avoid a redundant double-unlink at interpreter shutdown.
+            self._eicar_atexit_unregister = register_eicar_atexit_cleanup(self._eicar_temp_path)
 
             # The daemon fast path may ask clamd to open the temporary file
             # server-side, which can fail for fresh user-owned EICAR files.
@@ -1851,6 +1873,15 @@ class ScanView(Gtk.Box):
 
     def _start_scanning(self):
         """Start the scanning process."""
+        # Guard against re-entrant starts. A scan can be triggered from several
+        # paths (scan button, EICAR test, "run" from the manage-profiles dialog,
+        # the app-level start-scan action/accelerator). The scan/EICAR buttons
+        # are disabled while scanning, but the manage-profiles dialog and the
+        # app action are not — starting another scan here would spawn a second
+        # worker thread sharing the same Scanner, corrupting cancellation and
+        # leaving the UI in an inconsistent state. Ignore the duplicate request.
+        if self._is_scanning:
+            return
         self._is_scanning = True
         self._cancel_all_requested = False
         self._progress_session_id = getattr(self, "_progress_session_id", 0) + 1
@@ -1958,7 +1989,12 @@ class ScanView(Gtk.Box):
         Scans each selected path sequentially and aggregates results.
         """
         try:
-            if not self._selected_paths:
+            # Snapshot the targets: self._selected_paths can be repopulated
+            # from the main thread (e.g. a second CLI/file-manager invocation)
+            # while this worker is running; iterating the live list would
+            # corrupt the scan session.
+            targets = list(self._selected_paths)
+            if not targets:
                 # Should not happen, but handle gracefully
                 result = ScanResult(
                     status=ScanStatus.ERROR,
@@ -1999,15 +2035,20 @@ class ScanView(Gtk.Box):
             all_threat_details: list = []
             all_stdout: list[str] = []
             all_stderr: list[str] = []
+            all_skipped_files: list[str] = []
+            seen_skipped_files: set[str] = set()
+            all_nonfatal_warnings: list[str] = []
+            seen_nonfatal_warnings: set[str] = set()
+            all_warning_messages: list[str] = []
             has_errors = False
             error_messages: list[str] = []
             final_status = ScanStatus.CLEAN
 
-            target_count = len(self._selected_paths)
+            target_count = len(targets)
             backend_override = self._scan_backend_override
             daemon_force_stream = self._scan_daemon_force_stream
 
-            for idx, target_path in enumerate(self._selected_paths, start=1):
+            for idx, target_path in enumerate(targets, start=1):
                 # Check if cancel all was requested before starting next target
                 if self._cancel_all_requested:
                     logger.info(f"Cancel all requested, skipping target {idx}/{target_count}")
@@ -2045,23 +2086,27 @@ class ScanView(Gtk.Box):
                     daemon_force_stream=daemon_force_stream,
                 )
 
-                # Check if scan was cancelled (either this target or cancel all)
-                if result.status == ScanStatus.CANCELLED or self._cancel_all_requested:
-                    # Aggregate partial results from this cancelled target
-                    total_scanned_files += result.scanned_files
-                    total_scanned_dirs += result.scanned_dirs
-                    total_infected_count += result.infected_count
-                    all_infected_files.extend(result.infected_files)
-                    all_threat_details.extend(result.threat_details)
-                    final_status = ScanStatus.CANCELLED
-                    break
-
-                # Aggregate results
+                # Aggregate results (also partial results from a cancelled target)
                 total_scanned_files += result.scanned_files
                 total_scanned_dirs += result.scanned_dirs
                 total_infected_count += result.infected_count
                 all_infected_files.extend(result.infected_files)
                 all_threat_details.extend(result.threat_details)
+                for skipped in result.skipped_files or []:
+                    if skipped not in seen_skipped_files:
+                        seen_skipped_files.add(skipped)
+                        all_skipped_files.append(skipped)
+                for warning in result.nonfatal_warnings:
+                    if warning not in seen_nonfatal_warnings:
+                        seen_nonfatal_warnings.add(warning)
+                        all_nonfatal_warnings.append(warning)
+                if result.warning_message and result.warning_message not in all_warning_messages:
+                    all_warning_messages.append(result.warning_message)
+
+                # Check if scan was cancelled (either this target or cancel all)
+                if result.status == ScanStatus.CANCELLED or self._cancel_all_requested:
+                    final_status = ScanStatus.CANCELLED
+                    break
 
                 if result.stdout:
                     all_stdout.append(f"=== {target_path} ===\n{result.stdout}")
@@ -2085,12 +2130,15 @@ class ScanView(Gtk.Box):
                 else:
                     final_status = ScanStatus.CLEAN
 
+            # The count must match the deduplicated list: overlapping targets
+            # can report the same skipped file more than once.
+            total_skipped_count = len(all_skipped_files)
+            aggregated_warning = compose_scan_warning(total_skipped_count, all_warning_messages)
+
             # Build aggregated result
             aggregated_result = ScanResult(
                 status=final_status,
-                path=(
-                    ", ".join(self._selected_paths) if target_count > 1 else self._selected_paths[0]
-                ),
+                path=(", ".join(targets) if target_count > 1 else targets[0]),
                 stdout="\n\n".join(all_stdout),
                 stderr="\n\n".join(all_stderr),
                 exit_code=(1 if final_status == ScanStatus.INFECTED else (2 if has_errors else 0)),
@@ -2100,6 +2148,10 @@ class ScanView(Gtk.Box):
                 infected_count=total_infected_count,
                 error_message="; ".join(error_messages) if error_messages else None,
                 threat_details=all_threat_details,
+                skipped_files=all_skipped_files,
+                skipped_count=total_skipped_count,
+                warning_message=aggregated_warning,
+                nonfatal_warnings=all_nonfatal_warnings,
             )
 
             # Schedule UI update on main thread
@@ -2180,13 +2232,13 @@ class ScanView(Gtk.Box):
         Args:
             result: The ScanResult object containing scan findings
         """
-        # Clean up temp EICAR file
-        if self._eicar_temp_path and os.path.exists(self._eicar_temp_path):
-            try:
-                os.remove(self._eicar_temp_path)
-            except OSError as e:
-                logger.warning(f"Failed to clean up EICAR file: {e}")
+        # Clean up temp EICAR file (and drop the atexit safety net so it
+        # doesn't fire a second unlink at interpreter shutdown).
+        if self._eicar_temp_path:
+            cleanup_eicar_path(self._eicar_temp_path)
             self._eicar_temp_path = ""
+            self._eicar_atexit_unregister()
+            self._eicar_atexit_unregister = lambda: None
         self._scan_backend_override = None
         self._scan_daemon_force_stream = False
 
@@ -2216,14 +2268,7 @@ class ScanView(Gtk.Box):
             )
         elif result.status == ScanStatus.CLEAN:
             self._show_view_results(0)
-            if result.has_warnings:
-                # Clean but with warnings about skipped files
-                status_message = _(
-                    "Scan complete - No threats found ({count} file(s) not accessible)"
-                ).format(count=result.skipped_count)
-            else:
-                status_message = _("Scan complete - No threats found")
-            self._set_status_message(status_message, StatusLevel.SUCCESS)
+            self._set_status_message(clean_scan_status_message(result), StatusLevel.SUCCESS)
         elif result.status == ScanStatus.CANCELLED:
             self._show_view_results(result.infected_count)
             self._set_status_message(_("Scan cancelled"), StatusLevel.WARNING)
@@ -2264,11 +2309,12 @@ class ScanView(Gtk.Box):
         Args:
             error_msg: The error message to display
         """
-        # Clean up temp EICAR file if it exists
-        if self._eicar_temp_path and os.path.exists(self._eicar_temp_path):
-            with suppress(OSError):
-                os.remove(self._eicar_temp_path)
+        # Clean up temp EICAR file (and drop the atexit safety net).
+        if self._eicar_temp_path:
+            cleanup_eicar_path(self._eicar_temp_path)
             self._eicar_temp_path = ""
+            self._eicar_atexit_unregister()
+            self._eicar_atexit_unregister = lambda: None
         self._scan_backend_override = None
         self._scan_daemon_force_stream = False
 
@@ -2368,6 +2414,11 @@ class ScanView(Gtk.Box):
     def set_scan_state_changed_callback(self, callback):
         """Alias for set_on_scan_state_changed for backwards compatibility."""
         self.set_on_scan_state_changed(callback)
+
+    @property
+    def is_scanning(self) -> bool:
+        """Whether a scan is currently in progress."""
+        return self._is_scanning
 
     def get_selected_profile(self) -> "ScanProfile | None":
         """Return the currently selected scan profile."""

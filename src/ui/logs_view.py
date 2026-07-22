@@ -3,21 +3,28 @@
 Logs interface component for ClamUI with historical logs list and daemon logs section.
 """
 
+import threading
+
 import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, GLib, GObject, Gtk
 
-from ..core.i18n import _
+from ..core.i18n import _, ngettext
 from ..core.log_manager import DaemonStatus, LogEntry, LogManager
 from ..core.statistics_calculator import StatisticsCalculator
 from .clipboard_helper import ClipboardHelper
-from .compat import create_toolbar_view, safe_add_suffix, safe_add_titled_with_icon
+from .compat import (
+    create_toolbar_view,
+    remove_all_children,
+    safe_add_suffix,
+    safe_add_titled_with_icon,
+)
 from .file_export import CSV_FILTER, JSON_FILTER, TEXT_FILTER, FileExportHelper
 from .fullscreen_dialog import FullscreenLogDialog
 from .pagination import PaginatedListController
-from .utils import add_row_icon, resolve_icon_name
+from .utils import add_row_icon, enable_escape_to_close, resolve_icon_name
 from .view_helpers import EmptyStateConfig, create_empty_state, create_loading_row
 
 
@@ -56,6 +63,7 @@ class ClearLogsDialog(Adw.Window):
 
         # Configure as modal dialog
         self.set_modal(True)
+        enable_escape_to_close(self)
         self.set_deletable(True)
 
         self._setup_ui()
@@ -166,6 +174,10 @@ class LogsView(Gtk.Box):
 
         # Daemon log refresh timeout ID
         self._daemon_refresh_id: int | None = None
+        # Guards against stacking daemon-log reads behind the 3s periodic tick.
+        # Touched only on the GTK main loop (timer callback sets it, the idle_add
+        # applier clears it), so no cross-thread synchronization is required.
+        self._daemon_refresh_in_flight = False
 
         # Loading state for historical logs
         self._is_loading = False
@@ -536,13 +548,16 @@ class LogsView(Gtk.Box):
         self._daemon_text.set_bottom_margin(12)
         self._daemon_text.add_css_class("monospace")
 
-        # Set placeholder text
-        buffer = self._daemon_text.get_buffer()
-        buffer.set_text(
+        # Set placeholder text. Keep a reference so the export handler can
+        # recognize it regardless of locale (string matching on the English
+        # text would fail on translated placeholders).
+        self._daemon_placeholder_text = (
             _("Daemon logs will appear here.")
             + "\n\n"
             + _("Click the play button to start live updates.")
         )
+        buffer = self._daemon_text.get_buffer()
+        buffer.set_text(self._daemon_placeholder_text)
 
         scrolled.set_child(self._daemon_text)
 
@@ -599,7 +614,7 @@ class LogsView(Gtk.Box):
             self._all_log_entries = logs
 
             # Use pagination controller to display logs
-            self._pagination.set_entries(logs, entries_label="logs")
+            self._pagination.set_entries(logs, entries_label=_("logs"))
 
             # Handle empty logs - placeholder will be shown automatically
             # by GTK ListBox since we set it with set_placeholder()
@@ -652,12 +667,12 @@ class LogsView(Gtk.Box):
     def _add_load_more_button(self):
         """Add load more button (backward compatibility - delegates to pagination controller)."""
         if hasattr(self, "_pagination"):
-            self._pagination.add_load_more_button(entries_label="logs")
+            self._pagination.add_load_more_button(entries_label=_("logs"))
 
     def _on_load_more_logs_clicked(self, button):
         """Handle load more button click (backward compatibility - delegates to pagination controller)."""
         if hasattr(self, "_pagination"):
-            self._pagination.load_more(entries_label="logs")
+            self._pagination.load_more(entries_label=_("logs"))
 
     def _on_show_all_logs_clicked(self, button):
         """Handle show all button click (backward compatibility - delegates to pagination controller)."""
@@ -875,8 +890,8 @@ class LogsView(Gtk.Box):
         helper = ClipboardHelper(parent_widget=self)
         helper.copy_with_feedback(
             text=content,
-            success_message="Log details copied to clipboard",
-            error_message="Failed to copy to clipboard",
+            success_message=_("Log details copied to clipboard"),
+            error_message=_("Failed to copy to clipboard"),
             on_too_large=lambda: self._on_export_detail_text_clicked(button),
         )
 
@@ -892,7 +907,7 @@ class LogsView(Gtk.Box):
 
         helper = FileExportHelper(
             parent_widget=self,
-            dialog_title="Export Log Details",
+            dialog_title=_("Export Log Details"),
             filename_prefix="clamui_log",
             file_filter=TEXT_FILTER,
             content_generator=self._get_detail_text_content,
@@ -911,7 +926,7 @@ class LogsView(Gtk.Box):
 
         helper = FileExportHelper(
             parent_widget=self,
-            dialog_title="Export Log Details as CSV",
+            dialog_title=_("Export Log Details as CSV"),
             filename_prefix="clamui_log",
             file_filter=CSV_FILTER,
             content_generator=lambda: self._format_log_entry_as_csv(self._selected_log),
@@ -930,7 +945,7 @@ class LogsView(Gtk.Box):
 
         helper = FileExportHelper(
             parent_widget=self,
-            dialog_title="Export Log Details as JSON",
+            dialog_title=_("Export Log Details as JSON"),
             filename_prefix="clamui_log",
             file_filter=JSON_FILTER,
             content_generator=lambda: self._format_log_entry_as_json(self._selected_log),
@@ -1086,7 +1101,7 @@ class LogsView(Gtk.Box):
         content = buffer.get_text(start, end, False)
 
         # Create and present the fullscreen dialog
-        dialog = FullscreenLogDialog(title="Daemon Logs", content=content)
+        dialog = FullscreenLogDialog(title=_("Daemon Logs"), content=content)
         dialog.set_transient_for(self.get_root())
         dialog.present()
 
@@ -1099,16 +1114,16 @@ class LogsView(Gtk.Box):
         content = buffer.get_text(start, end, False)
 
         # Don't export placeholder text
-        if "will appear here" in content:
+        if not content or content == getattr(self, "_daemon_placeholder_text", None):
             return
 
         helper = FileExportHelper(
             parent_widget=self,
-            dialog_title="Export Daemon Logs",
+            dialog_title=_("Export Daemon Logs"),
             filename_prefix="clamd_logs",
             file_filter=TEXT_FILTER,
             content_generator=lambda: content,
-            success_message="Exported daemon logs",
+            success_message=_("Exported daemon logs"),
         )
         helper.show_save_dialog()
 
@@ -1125,11 +1140,13 @@ class LogsView(Gtk.Box):
         count = len(self._all_log_entries)
         helper = FileExportHelper(
             parent_widget=self,
-            dialog_title="Export All Logs to CSV",
+            dialog_title=_("Export All Logs to CSV"),
             filename_prefix="clamui_logs",
             file_filter=CSV_FILTER,
             content_generator=self._format_all_logs_as_csv,
-            success_message=f"Exported {count} logs",
+            success_message=ngettext("Exported {n} log", "Exported {n} logs", count).format(
+                n=count
+            ),
         )
         helper.show_save_dialog()
 
@@ -1146,11 +1163,13 @@ class LogsView(Gtk.Box):
         count = len(self._all_log_entries)
         helper = FileExportHelper(
             parent_widget=self,
-            dialog_title="Export All Logs to JSON",
+            dialog_title=_("Export All Logs to JSON"),
             filename_prefix="clamui_logs",
             file_filter=JSON_FILTER,
             content_generator=self._format_all_logs_as_json,
-            success_message=f"Exported {count} logs",
+            success_message=ngettext("Exported {n} log", "Exported {n} logs", count).format(
+                n=count
+            ),
         )
         helper.show_save_dialog()
 
@@ -1213,7 +1232,8 @@ class LogsView(Gtk.Box):
 
                 # Clear existing rows and show loading placeholder in listbox
                 # This is done synchronously but is fast enough for typical row counts
-                self._logs_listbox.remove_all()
+                # (Gtk.ListBox.remove_all() requires GTK 4.12+)
+                remove_all_children(self._logs_listbox)
                 loading_row = self._create_loading_state()
                 self._logs_listbox.append(loading_row)
             else:
@@ -1229,9 +1249,22 @@ class LogsView(Gtk.Box):
             self._is_loading = False
 
     def _check_daemon_status(self) -> bool:
-        """Check and display daemon status."""
-        status, message = self._log_manager.get_daemon_status()
+        """Kick off an off-main-thread daemon-status check.
 
+        get_daemon_status() shells out to systemctl/pgrep, which can block the GTK
+        main loop; run it on a worker thread and apply the result on the main loop.
+        Scheduled once via GLib.idle_add on load, so returns False (no repeat).
+        """
+        threading.Thread(target=self._check_daemon_status_worker, daemon=True).start()
+        return False
+
+    def _check_daemon_status_worker(self) -> None:
+        """Worker: read daemon status off the main loop, then schedule the UI update."""
+        status, message = self._log_manager.get_daemon_status()
+        GLib.idle_add(self._apply_daemon_status, status, message)
+
+    def _apply_daemon_status(self, status, message) -> bool:
+        """Apply a daemon-status result to the UI (runs on the GTK main loop)."""
         if status == DaemonStatus.RUNNING:
             self._daemon_status_row.set_subtitle(_("Running"))
             self._daemon_status_icon.set_from_icon_name(resolve_icon_name("object-select-symbolic"))
@@ -1297,8 +1330,27 @@ class LogsView(Gtk.Box):
             self._daemon_refresh_id = None
 
     def _refresh_daemon_logs(self) -> bool:
-        """Refresh daemon logs display."""
+        """Kick off an off-main-thread daemon-log refresh.
+
+        read_daemon_logs() runs tail/journalctl, which can block the GTK main loop
+        for seconds; do it on a worker thread and apply the result on the main loop.
+        An in-flight guard prevents a slow read from stacking behind the 3s tick.
+        Returns whether the periodic timer should keep firing.
+        """
+        if not self._daemon_refresh_in_flight:
+            self._daemon_refresh_in_flight = True
+            threading.Thread(target=self._refresh_daemon_logs_worker, daemon=True).start()
+        # Keep the periodic timer alive while live refresh is active.
+        return self._daemon_refresh_id is not None
+
+    def _refresh_daemon_logs_worker(self) -> None:
+        """Worker: read daemon logs off the main loop, then schedule the UI update."""
         success, content = self._log_manager.read_daemon_logs(num_lines=100)
+        GLib.idle_add(self._apply_daemon_logs, success, content)
+
+    def _apply_daemon_logs(self, success, content) -> bool:
+        """Apply a daemon-log read result to the UI (runs on the GTK main loop)."""
+        self._daemon_refresh_in_flight = False
 
         buffer = self._daemon_text.get_buffer()
 
@@ -1310,12 +1362,11 @@ class LogsView(Gtk.Box):
             # Enable export button when logs are available
             self._export_daemon_button.set_sensitive(True)
         else:
-            buffer.set_text(f"Error loading daemon logs:\n\n{content}")
+            buffer.set_text(_("Error loading daemon logs:") + f"\n\n{content}")
             # Disable export button on error
             self._export_daemon_button.set_sensitive(False)
 
-        # Return True to continue periodic refresh, False otherwise
-        return self._daemon_refresh_id is not None
+        return False  # idle_add: run once
 
     def refresh_logs(self):
         """

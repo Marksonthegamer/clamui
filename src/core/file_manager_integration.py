@@ -18,8 +18,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
-from .flatpak import is_flatpak, wrap_host_command
+from .flatpak import get_clean_env, is_flatpak, wrap_host_command
 from .i18n import N_, _
+from .path_validation import validate_path
 
 logger = logging.getLogger(__name__)
 
@@ -312,6 +313,7 @@ def _refresh_dolphin_service_menu_cache() -> None:
                 check=True,
                 text=True,
                 timeout=10,
+                env=get_clean_env(),
             )
             logger.info("Refreshed KDE service menu cache via %s", binary)
             return
@@ -450,6 +452,19 @@ def install_integration(file_manager: FileManager) -> tuple[bool, str | None]:
             # Create destination directory if needed
             dest_path.parent.mkdir(parents=True, exist_ok=True)
 
+            is_valid, error = validate_path(str(dest_path.parent))
+            if not is_valid:
+                logger.warning(
+                    "Invalid destination path for integration file: %s - %s",
+                    dest_path,
+                    error,
+                )
+                return False, _("Invalid destination path: {path}").format(path=dest_path)
+
+            if dest_path.parent.is_symlink():
+                logger.warning("Destination parent is a symlink, skipping: %s", dest_path)
+                return False, _("Invalid destination path: {path}").format(path=dest_path)
+
             # Copy the file
             shutil.copy2(source_path, dest_path)
 
@@ -523,6 +538,20 @@ def repair_integration(file_manager: FileManager) -> tuple[bool, str | None]:
                 continue
 
             dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+            is_valid, error = validate_path(str(dest_path.parent))
+            if not is_valid:
+                logger.warning(
+                    "Invalid destination path for integration file: %s - %s",
+                    dest_path,
+                    error,
+                )
+                return False, _("Invalid destination path: {path}").format(path=dest_path)
+
+            if dest_path.parent.is_symlink():
+                logger.warning("Destination parent is a symlink, skipping: %s", dest_path)
+                return False, _("Invalid destination path: {path}").format(path=dest_path)
+
             shutil.copy2(source_path, dest_path)
 
             _set_integration_permissions(file_manager, source_name, dest_path)

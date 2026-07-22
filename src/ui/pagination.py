@@ -150,7 +150,7 @@ class PaginatedListController:
                 # Skip entries that fail to render (corrupted data)
                 continue
 
-    def add_load_more_button(self, entries_label: str = "entries"):
+    def add_load_more_button(self, entries_label: str | None = None):
         """
         Add a 'Show More' and 'Show All' button row to the listbox.
 
@@ -165,6 +165,9 @@ class PaginatedListController:
             entries_label: Label for the items being paginated (e.g., "entries",
                           "logs", "filtered entries"). Used in progress text.
         """
+        if entries_label is None:
+            entries_label = _("entries")
+
         load_more_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         load_more_box.set_halign(Gtk.Align.CENTER)
         load_more_box.set_margin_top(12)
@@ -218,7 +221,7 @@ class PaginatedListController:
         self._load_more_row = load_more_row
         self._listbox.append(load_more_row)
 
-    def load_more(self, entries_label: str = "entries"):
+    def load_more(self, entries_label: str | None = None):
         """
         Load and display the next batch of entries.
 
@@ -286,7 +289,7 @@ class PaginatedListController:
             # Explicitly return False to remove callback after execution
             GLib.idle_add(lambda: (vadj.set_value(scroll_pos), False)[1])
 
-    def set_entries(self, entries: list, entries_label: str = "entries"):
+    def set_entries(self, entries: list, entries_label: str | None = None):
         """
         Set entries and display initial batch with pagination.
 
@@ -317,12 +320,18 @@ class PaginatedListController:
         if not entries:
             return
 
-        # Display initial batch with pagination
-        initial_limit = min(self._initial_limit, len(entries))
+        # Display initial batch with pagination. Base decisions on the entries
+        # that will actually be displayed (entries_to_display), not the raw
+        # backing list: a subclass may override entries_to_display() to return
+        # a filtered subset. Using len(entries) here would add a bogus
+        # "Load More" button (e.g. "Show 0 More") and suppress the no-results
+        # placeholder whenever a filter narrows the list below the initial limit.
+        display_entries = self.entries_to_display
+        initial_limit = min(self._initial_limit, len(display_entries))
         self.display_batch(0, initial_limit)
 
-        # Add "Load More" button if there are more entries
-        if len(entries) > self._initial_limit:
+        # Add "Load More" button only if more displayable entries remain
+        if len(display_entries) > self._initial_limit:
             self.add_load_more_button(entries_label)
 
     def _on_load_more_clicked(self, button):

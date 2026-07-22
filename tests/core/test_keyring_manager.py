@@ -166,15 +166,27 @@ class TestKeyringManager:
         assert error is None
         mock_keyring.set_password.assert_called_once_with(SERVICE_NAME, VT_API_KEY_NAME, test_key)
 
-    def test_set_api_key_fallback_to_settings(self, settings_manager, mock_keyring):
-        """Test falling back to settings when keyring fails."""
+    def test_set_api_key_fallback_refused_when_not_opted_in(self, settings_manager, mock_keyring):
+        """Plaintext fallback is refused unless the user has opted in."""
         test_key = "d" * 64
         mock_keyring.set_password.side_effect = Exception("Keyring error")
 
         with mock.patch("src.core.keyring_manager._get_keyring", return_value=mock_keyring):
             success, error = set_api_key(test_key, settings_manager)
 
-        # Should succeed with fallback
+        assert success is False
+        assert error is not None
+        assert settings_manager.get("virustotal_api_key") is None
+
+    def test_set_api_key_fallback_to_settings_when_opted_in(self, settings_manager, mock_keyring):
+        """Plaintext fallback works when the user has explicitly opted in."""
+        test_key = "d" * 64
+        mock_keyring.set_password.side_effect = Exception("Keyring error")
+        settings_manager.set("allow_plaintext_api_key_fallback", True)
+
+        with mock.patch("src.core.keyring_manager._get_keyring", return_value=mock_keyring):
+            success, error = set_api_key(test_key, settings_manager)
+
         assert success is True
         assert settings_manager.get("virustotal_api_key") == test_key
 

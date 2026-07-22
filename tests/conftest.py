@@ -9,6 +9,7 @@ This file provides:
 - Locale forcing (LANGUAGE=C) to ensure English gettext output
 """
 
+import contextlib
 import gettext
 import os
 import sys
@@ -220,6 +221,34 @@ def _clear_src_modules():
     modules_to_remove = [mod for mod in sys.modules if mod.startswith("src.")]
     for mod in modules_to_remove:
         del sys.modules[mod]
+
+
+@contextlib.contextmanager
+def preserve_displaced_modules(match=None):
+    """Snapshot matching sys.modules entries and restore them on exit.
+
+    Test modules that clear or mock src.* (or gi/matplotlib) modules must put
+    the ORIGINAL module objects back afterwards: other test modules bind src
+    symbols at collection time, and patching a re-imported module while
+    calling a stale reference makes assertions silently miss (see the
+    tests/cli/test_scan_cmd.py pollution this pattern fixed). Use this instead
+    of hand-rolling the snapshot/restore idiom.
+
+    Args:
+        match: Predicate on the module name; defaults to src.* modules.
+    """
+    if match is None:
+
+        def match(name):
+            return name.startswith("src.")
+
+    snapshot = {name: module for name, module in sys.modules.items() if match(name)}
+    try:
+        yield
+    finally:
+        for name in [mod for mod in sys.modules if match(mod)]:
+            del sys.modules[name]
+        sys.modules.update(snapshot)
 
 
 # =============================================================================

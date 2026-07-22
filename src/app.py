@@ -83,7 +83,7 @@ class ClamUIApp(Adw.Application):
     - Tray: _on_tray_quick_scan, _on_tray_full_scan, _on_tray_update,
             _on_tray_quit, _on_tray_window_toggle, _on_tray_profile_select
     - Quick scan: _on_statistics_quick_scan, _do_tray_quick_scan
-    - Settings: _get_quick_scan_profile, switch_to_view, set_initial_scan_paths
+    - Settings: _get_quick_scan_profile, set_initial_scan_paths
 
     Collaboration:
     - AppLifecycleManager: Handles shutdown, device monitor, database dir
@@ -201,7 +201,7 @@ class ClamUIApp(Adw.Application):
         if self._quarantine_manager is None:
             from .core.quarantine import QuarantineManager
 
-            self._quarantine_manager = QuarantineManager()
+            self._quarantine_manager = QuarantineManager(settings_manager=self._settings_manager)
         return self._quarantine_manager
 
     @property
@@ -863,6 +863,12 @@ class ClamUIApp(Adw.Application):
             win.set_active_view(view_name)
             self._current_view = view_name
 
+    def _show_window_toast(self, message: str) -> None:
+        """Show a toast notification on the main window if one is available."""
+        win = self.props.active_window
+        if win is not None and hasattr(win, "add_toast"):
+            win.add_toast(Adw.Toast.new(message))
+
     def set_initial_scan_paths(self, file_paths: list[str], use_virustotal: bool = False):
         """Store initial scan paths from CLI or file manager integration."""
         self._initial_scan_paths = file_paths
@@ -874,18 +880,52 @@ class ClamUIApp(Adw.Application):
         if not self._initial_scan_paths:
             return
 
+        if not self._scan_view:
+            # Keep the request pending; do_activate re-processes it once the
+            # scan view has been created.
+            return
+
+        if self._scan_view.is_scanning:
+            # Repopulating the selection now would mutate the target list the
+            # scan worker thread is using; drop the request and tell the user.
+            self._initial_scan_paths = []
+            self._initial_use_virustotal = False
+            self._show_window_toast(
+                _("A scan is already running — the new scan request was ignored")
+            )
+            return
+
         paths = self._initial_scan_paths
         self._initial_scan_paths = []
 
         use_vt = self._initial_use_virustotal
         self._initial_use_virustotal = False
 
-        if self._scan_view:
+        # Surface the scan UI so a second invocation does not start a scan
+        # invisibly under whichever view is currently shown.
+        self._view_coordinator.switch_to_view("scan", self.scan_view)
+
+        if use_vt:
+            # VirusTotal scans a single file per request; only the first
+            # path is forwarded to the setup dialog and scan pipeline.
+            if len(paths) > 1:
+                ignored_count = len(paths) - 1
+                self._show_window_toast(
+                    ngettext(
+                        "VirusTotal scans one file per request — "
+                        "{count} additional selection was ignored",
+                        "VirusTotal scans one file per request — "
+                        "{count} additional selections were ignored",
+                        ignored_count,
+                    ).format(count=ignored_count)
+                )
             self._scan_view._set_selected_path(paths[0])
-            if use_vt:
-                self._show_virustotal_setup_dialog(paths[0])
-            else:
-                self._scan_view._start_scan()
+            self._show_virustotal_setup_dialog(paths[0])
+        else:
+            # ClamAV scans every CLI-provided target (files and folders),
+            # so populate the full selection before starting.
+            self._scan_view._replace_selected_paths(paths)
+            self._scan_view._start_scan()
 
     def _trigger_virustotal_scan(self, file_path: str, api_key: str) -> None:
         """Trigger a VirusTotal scan for the specified file."""
@@ -893,13 +933,36 @@ class ClamUIApp(Adw.Application):
 
         def on_scan_complete(result):
             try:
-                from .core.log_manager import LogManager
+                from .core.log_manager import LogEntry, LogManager
 
                 log_manager = LogManager()
-                log_manager.add_virustotal_result(result)
-                self._show_virustotal_results_dialog(result)
+                log_entry = LogEntry.from_virustotal_result_data(
+                    vt_status=result.status.value,
+                    file_path=result.file_path,
+                    duration=result.duration,
+                    sha256=result.sha256,
+                    detections=result.detections,
+                    total_engines=result.total_engines,
+                    detection_details=[
+                        {
+                            "engine_name": d.engine_name,
+                            "category": d.category,
+                            "result": d.result,
+                        }
+                        for d in result.detection_details
+                    ],
+                    permalink=result.permalink,
+                    error_message=result.error_message,
+                )
+                log_manager.save_log(log_entry)
             except Exception as e:
-                logger.error(f"Error processing VirusTotal result: {e}")
+                logger.error(f"Failed to save VirusTotal log: {e}")
+
+            # Show the results dialog regardless of whether logging succeeded.
+            # (Previously this lived inside the try above and never ran, because
+            # the log call referenced a nonexistent LogManager.add_virustotal_result
+            # method that raised AttributeError.)
+            self._show_virustotal_results_dialog(result)
 
         def scan_thread():
             try:
@@ -931,7 +994,10 @@ class ClamUIApp(Adw.Application):
 
         win = self.props.active_window
         if win:
-            dialog = VirusTotalResultsDialog(win, result)
+            # VirusTotalResultsDialog.__init__ takes the result as its first
+            # argument; the parent is set separately (mirrors the scan coordinator).
+            dialog = VirusTotalResultsDialog(vt_result=result)
+            dialog.set_transient_for(win)
             dialog.present()
 
     def _open_virustotal_website(self, url: str):

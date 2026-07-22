@@ -61,6 +61,14 @@ class QuarantineEntry:
         Returns:
             New QuarantineEntry instance
         """
+        # VULN-004: defense-in-depth — mask permission bits read from DB to
+        # the low 9 bits (rwx for user/group/other). Prevents setuid/setgid/
+        # sticky bits from propagating out of a tampered or corrupted DB row.
+        raw_perms = row[7] if len(row) > 7 else None
+        if raw_perms is None:
+            masked_perms = 0o644
+        else:
+            masked_perms = raw_perms & 0o777
         return cls(
             id=row[0],
             original_path=row[1],
@@ -69,7 +77,7 @@ class QuarantineEntry:
             detection_date=row[4],
             file_size=row[5],
             file_hash=row[6],
-            original_permissions=row[7] if len(row) > 7 else 0o644,
+            original_permissions=masked_perms,
         )
 
 
@@ -214,13 +222,19 @@ class QuarantineDatabase:
         ]
 
         for db_file in db_files:
-            if db_file.exists():
-                try:
-                    os.chmod(db_file, self.DB_FILE_PERMISSIONS)
-                except (OSError, PermissionError):
-                    # Silently handle permission errors to avoid breaking database functionality
-                    # on systems with restrictive security policies or immutable files
-                    logger.debug("Failed to enforce permissions on %s", db_file, exc_info=True)
+            # Open with O_NOFOLLOW so a symlink planted here cannot redirect chmod
+            # to an arbitrary file. ENOENT is expected for WAL/SHM when SQLite hasn't
+            # created them yet; ELOOP means a symlink — both are silently skipped.
+            try:
+                fd = os.open(db_file, os.O_RDONLY | os.O_NOFOLLOW)
+            except OSError:
+                continue
+            try:
+                os.fchmod(fd, self.DB_FILE_PERMISSIONS)
+            except OSError:
+                logger.debug("Failed to enforce permissions on %s", db_file, exc_info=True)
+            finally:
+                os.close(fd)
 
     def _init_database(self) -> None:
         """Initialize the database schema if it doesn't exist."""
@@ -238,6 +252,9 @@ class QuarantineDatabase:
                             file_size INTEGER NOT NULL,
                             file_hash TEXT NOT NULL,
                             original_permissions INTEGER NOT NULL DEFAULT 420
+                                CHECK (original_permissions BETWEEN 0 AND 511),
+                            state TEXT NOT NULL DEFAULT 'active'
+                                CHECK (state IN ('active', 'restored', 'deleted'))
                         )
                         """
                     )
@@ -264,6 +281,15 @@ class QuarantineDatabase:
                             """
                             ALTER TABLE quarantine
                             ADD COLUMN original_permissions INTEGER NOT NULL DEFAULT 420
+                                CHECK (original_permissions BETWEEN 0 AND 511)
+                            """
+                        )
+                    if "state" not in columns:
+                        conn.execute(
+                            """
+                            ALTER TABLE quarantine
+                            ADD COLUMN state TEXT NOT NULL DEFAULT 'active'
+                                CHECK (state IN ('active', 'restored', 'deleted'))
                             """
                         )
 
@@ -302,6 +328,10 @@ class QuarantineDatabase:
         Returns:
             The ID of the newly created entry, or None if failed
         """
+        # VULN-004: defense-in-depth — mask permission bits before insert so
+        # the DB only ever stores the low 9 bits (rwx user/group/other).
+        # Prevents accidental or malicious propagation of setuid/setgid/sticky.
+        original_permissions = original_permissions & 0o777
         with self._lock:
             try:
                 with self._get_connection() as conn:

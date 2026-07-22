@@ -18,12 +18,28 @@ from unittest import mock
 
 import pytest
 
+from tests.conftest import preserve_displaced_modules
+
 
 def _clear_src_modules():
     """Clear all cached src.* modules to prevent test pollution."""
     modules_to_remove = [mod for mod in sys.modules if mod.startswith("src.")]
     for mod in modules_to_remove:
         del sys.modules[mod]
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _restore_src_modules_after_module():
+    """Restore the src.* modules displaced by this module's GTK mocking.
+
+    The fixtures here (and conftest's mock_gi_modules) clear src.* modules
+    around every test. Without restoring the original module objects, test
+    modules that imported src symbols at collection time (e.g.
+    tests/cli/test_scan_cmd.py) would later patch a re-imported module while
+    calling stale references bound to the original module's globals.
+    """
+    with preserve_displaced_modules():
+        yield
 
 
 @pytest.fixture
@@ -938,6 +954,10 @@ class TestScanWorker:
         mock_result.stdout = "Scanned 10 files"
         mock_result.stderr = ""
         mock_result.error_message = None
+        mock_result.skipped_files = []
+        mock_result.skipped_count = 0
+        mock_result.warning_message = None
+        mock_result.nonfatal_warnings = []
 
         mock_scan_view._scanner.scan_sync.return_value = mock_result
         mock_scan_view._selected_paths = ["/home/user/test.txt"]
@@ -986,6 +1006,10 @@ class TestScanWorker:
         mock_result.stdout = ""
         mock_result.stderr = ""
         mock_result.error_message = None
+        mock_result.skipped_files = []
+        mock_result.skipped_count = 0
+        mock_result.warning_message = None
+        mock_result.nonfatal_warnings = []
 
         mock_scan_view._scanner.scan_sync.return_value = mock_result
         mock_scan_view._selected_paths = ["/home/user/eicar.txt"]
@@ -1084,6 +1108,10 @@ class TestMultiTargetScanning:
         mock_result.stdout = ""
         mock_result.stderr = ""
         mock_result.error_message = None
+        mock_result.skipped_files = []
+        mock_result.skipped_count = 0
+        mock_result.warning_message = None
+        mock_result.nonfatal_warnings = []
 
         # Make status comparisons work (return False so status != CANCELLED)
         mock_result.status.__eq__ = mock.MagicMock(return_value=False)
@@ -1127,6 +1155,10 @@ class TestMultiTargetScanning:
             result.stdout = f"scanned {files}"
             result.stderr = ""
             result.error_message = None
+            result.skipped_files = []
+            result.skipped_count = 0
+            result.warning_message = None
+            result.nonfatal_warnings = []
             return result
 
         results = [create_result(10, 0), create_result(20, 1), create_result(5, 0)]
@@ -1156,6 +1188,151 @@ class TestMultiTargetScanning:
                 call_kwargs = mock_scan_result_class.call_args[1]
                 assert call_kwargs["scanned_files"] == 35  # 10 + 20 + 5
                 assert call_kwargs["infected_count"] == 1
+
+    def _create_clean_result(self, **overrides):
+        """Create a clean per-target result mock with warning-field defaults."""
+        result = mock.MagicMock()
+        result.status = mock.MagicMock()
+        result.scanned_files = 1
+        result.scanned_dirs = 0
+        result.infected_count = 0
+        result.infected_files = []
+        result.threat_details = []
+        result.stdout = ""
+        result.stderr = ""
+        result.error_message = None
+        result.skipped_files = []
+        result.skipped_count = 0
+        result.warning_message = None
+        result.nonfatal_warnings = []
+        for name, value in overrides.items():
+            setattr(result, name, value)
+        return result
+
+    def test_scan_worker_snapshots_targets_against_concurrent_replacement(self, mock_scan_view):
+        """Replacing _selected_paths mid-scan must not affect the running worker.
+
+        Regression: a second CLI/file-manager invocation reached
+        _replace_selected_paths(), clearing and repopulating the SAME list the
+        worker thread was iterating. The worker now snapshots the targets once
+        and uses that snapshot for the whole scan session.
+        """
+        self._setup_multi_scan_mocks(mock_scan_view)
+
+        def scan_and_mutate(path, **kwargs):
+            # Simulate the main thread clearing and repopulating the selection
+            # (what _replace_selected_paths does) while this target scans.
+            mock_scan_view._selected_paths.clear()
+            mock_scan_view._selected_paths.extend(["/intruder1", "/intruder2", "/intruder3"])
+            return self._create_clean_result(scanned_files=5)
+
+        mock_scan_view._scanner.scan_sync.side_effect = scan_and_mutate
+        mock_scan_view._selected_paths = ["/path1", "/path2"]
+        mock_scan_view._cancel_all_requested = False
+
+        with mock.patch("src.ui.scan_view.GLib") as mock_glib:
+            mock_glib.idle_add.side_effect = lambda callback, *args: True
+
+            with mock.patch("src.ui.scan_view.ScanStatus") as mock_scan_status:
+                mock_scan_status.CLEAN = "clean"
+                mock_scan_status.INFECTED = "infected"
+                mock_scan_status.ERROR = "error"
+                mock_scan_status.CANCELLED = "cancelled"
+
+                with mock.patch("src.ui.scan_view.ScanResult") as mock_scan_result_class:
+                    mock_scan_view._scan_worker()
+
+        # Only the snapshotted targets are scanned — never the intruders.
+        calls = mock_scan_view._scanner.scan_sync.call_args_list
+        assert [call[0][0] for call in calls] == ["/path1", "/path2"]
+        # The aggregated result path is derived from the snapshot too.
+        call_kwargs = mock_scan_result_class.call_args[1]
+        assert call_kwargs["path"] == "/path1, /path2"
+        assert call_kwargs["scanned_files"] == 10
+
+    def test_multi_target_scan_aggregates_skipped_and_warning_fields(self, mock_scan_view):
+        """skipped_files/skipped_count/warning_message must survive aggregation.
+
+        Regression (#149): the aggregated ScanResult dropped these fields
+        entirely, so multi-target scans could never surface warnings in the GUI.
+        """
+        self._setup_multi_scan_mocks(mock_scan_view)
+
+        results = [
+            self._create_clean_result(
+                skipped_files=["/root/secret.txt", "/root/other.txt"],
+                skipped_count=2,
+                warning_message="2 file(s) could not be accessed",
+                nonfatal_warnings=["LibClamAV Warning: first"],
+            ),
+            self._create_clean_result(
+                skipped_files=["/root/other.txt", "/etc/shadow"],
+                skipped_count=2,
+                warning_message="2 file(s) could not be accessed",
+                nonfatal_warnings=["LibClamAV Warning: first", "LibClamAV Warning: second"],
+            ),
+        ]
+        mock_scan_view._scanner.scan_sync.side_effect = results
+        mock_scan_view._selected_paths = ["/path1", "/path2"]
+        mock_scan_view._cancel_all_requested = False
+
+        with mock.patch("src.ui.scan_view.GLib") as mock_glib:
+            mock_glib.idle_add.side_effect = lambda callback, *args: True
+
+            with mock.patch("src.ui.scan_view.ScanStatus") as mock_scan_status:
+                mock_scan_status.CLEAN = "clean"
+                mock_scan_status.INFECTED = "infected"
+                mock_scan_status.ERROR = "error"
+                mock_scan_status.CANCELLED = "cancelled"
+
+                with mock.patch("src.ui.scan_view.ScanResult") as mock_scan_result_class:
+                    mock_scan_view._scan_worker()
+
+        call_kwargs = mock_scan_result_class.call_args[1]
+        # Union of skipped files, deduplicated, order preserved.
+        assert call_kwargs["skipped_files"] == [
+            "/root/secret.txt",
+            "/root/other.txt",
+            "/etc/shadow",
+        ]
+        # Count derived from the deduplicated list — the file skipped by both
+        # overlapping targets must not be counted twice.
+        assert call_kwargs["skipped_count"] == 3
+        # Summary re-derived with the single-target phrasing.
+        assert call_kwargs["warning_message"] == "3 file(s) could not be accessed"
+        # nonfatal_warnings aggregated (deduplicated) into the constructor.
+        assert call_kwargs["nonfatal_warnings"] == [
+            "LibClamAV Warning: first",
+            "LibClamAV Warning: second",
+        ]
+
+    def test_multi_target_scan_joins_nonskip_warning_messages(self, mock_scan_view):
+        """Without skipped files, distinct per-target warning messages are joined."""
+        self._setup_multi_scan_mocks(mock_scan_view)
+
+        results = [
+            self._create_clean_result(warning_message="scan completed with warnings"),
+            self._create_clean_result(),
+        ]
+        mock_scan_view._scanner.scan_sync.side_effect = results
+        mock_scan_view._selected_paths = ["/path1", "/path2"]
+        mock_scan_view._cancel_all_requested = False
+
+        with mock.patch("src.ui.scan_view.GLib") as mock_glib:
+            mock_glib.idle_add.side_effect = lambda callback, *args: True
+
+            with mock.patch("src.ui.scan_view.ScanStatus") as mock_scan_status:
+                mock_scan_status.CLEAN = "clean"
+                mock_scan_status.INFECTED = "infected"
+                mock_scan_status.ERROR = "error"
+                mock_scan_status.CANCELLED = "cancelled"
+
+                with mock.patch("src.ui.scan_view.ScanResult") as mock_scan_result_class:
+                    mock_scan_view._scan_worker()
+
+        call_kwargs = mock_scan_result_class.call_args[1]
+        assert call_kwargs["skipped_count"] == 0
+        assert call_kwargs["warning_message"] == "scan completed with warnings"
 
 
 class TestCancelScan:
@@ -1198,6 +1375,10 @@ class TestCancelScan:
         mock_result.stdout = ""
         mock_result.stderr = ""
         mock_result.error_message = None
+        mock_result.skipped_files = []
+        mock_result.skipped_count = 0
+        mock_result.warning_message = None
+        mock_result.nonfatal_warnings = []
 
         mock_scan_view._scanner.scan_sync.return_value = mock_result
         mock_scan_view._selected_paths = ["/path1", "/path2", "/path3"]
@@ -1237,6 +1418,10 @@ class TestCancelScan:
             result.stdout = ""
             result.stderr = ""
             result.error_message = None
+            result.skipped_files = []
+            result.skipped_count = 0
+            result.warning_message = None
+            result.nonfatal_warnings = []
             return result
 
         mock_scan_view._scanner.scan_sync.side_effect = create_result_and_cancel
@@ -1299,6 +1484,8 @@ class TestScanComplete:
         result.infected_count = 0
         result.error_message = None
         result.stderr = ""
+        result.skipped_count = 0
+        result.warning_message = None
 
         # Make status comparison work for CLEAN
         with mock.patch("src.ui.scan_view.ScanStatus") as mock_scan_status:
@@ -1317,6 +1504,62 @@ class TestScanComplete:
         mock_scan_view._cancel_button.set_visible.assert_called_with(False)
         mock_scan_view._stop_progress_pulse.assert_called_once()
         mock_scan_view._show_view_results.assert_called_once_with(0)
+
+    def test_on_scan_complete_clean_with_skipped_files_shows_count(self, mock_scan_view):
+        """A clean result with skipped files renders the not-accessible count."""
+        self._setup_complete_mocks(mock_scan_view)
+
+        clean_status = mock.MagicMock()
+        result = mock.MagicMock()
+        result.status = clean_status
+        result.infected_count = 0
+        result.error_message = None
+        result.stderr = ""
+        result.skipped_count = 3
+        result.warning_message = "3 file(s) could not be accessed"
+
+        with mock.patch("src.ui.scan_view.ScanStatus") as mock_scan_status:
+            mock_scan_status.CLEAN = clean_status
+            mock_scan_status.INFECTED = mock.MagicMock()
+            mock_scan_status.ERROR = mock.MagicMock()
+            mock_scan_status.CANCELLED = mock.MagicMock()
+
+            mock_scan_view._on_scan_complete(result)
+
+        banner_title = mock_scan_view._status_banner.set_title.call_args[0][0]
+        assert "No threats found" in banner_title
+        assert "3 file(s) not accessible" in banner_title
+
+    def test_on_scan_complete_clean_nonfatal_warning_uses_warning_message(self, mock_scan_view):
+        """Warnings without skipped files must never render a bare '0 file(s)'.
+
+        Regression (#149): with skipped_count == 0 but a non-fatal warning
+        present, the banner said "0 file(s) not accessible" instead of
+        surfacing the actual warning message.
+        """
+        self._setup_complete_mocks(mock_scan_view)
+
+        clean_status = mock.MagicMock()
+        result = mock.MagicMock()
+        result.status = clean_status
+        result.infected_count = 0
+        result.error_message = None
+        result.stderr = ""
+        result.skipped_count = 0
+        result.warning_message = "LibClamAV Warning: bytecode execution failed"
+
+        with mock.patch("src.ui.scan_view.ScanStatus") as mock_scan_status:
+            mock_scan_status.CLEAN = clean_status
+            mock_scan_status.INFECTED = mock.MagicMock()
+            mock_scan_status.ERROR = mock.MagicMock()
+            mock_scan_status.CANCELLED = mock.MagicMock()
+
+            mock_scan_view._on_scan_complete(result)
+
+        banner_title = mock_scan_view._status_banner.set_title.call_args[0][0]
+        assert "No threats found" in banner_title
+        assert "0 file(s)" not in banner_title
+        assert "LibClamAV Warning: bytecode execution failed" in banner_title
 
     def test_on_scan_complete_infected_result(self, mock_scan_view):
         """Test scan complete handler with infected result."""
@@ -1392,6 +1635,8 @@ class TestScanComplete:
         result.infected_count = 0
         result.error_message = None
         result.stderr = ""
+        result.skipped_count = 0
+        result.warning_message = None
 
         with mock.patch("src.ui.scan_view.ScanStatus") as mock_scan_status:
             mock_scan_status.CLEAN = clean_status
@@ -1418,6 +1663,8 @@ class TestScanComplete:
         result.infected_count = 0
         result.error_message = None
         result.stderr = ""
+        result.skipped_count = 0
+        result.warning_message = None
 
         with mock.patch("src.ui.scan_view.ScanStatus") as mock_scan_status:
             mock_scan_status.CLEAN = clean_status
@@ -1844,6 +2091,27 @@ class TestStartScanning:
         mock_scan_view._progress_section.set_visible.assert_called_with(True)
         mock_scan_view._start_progress_pulse.assert_called_once()
 
+    def test_start_scanning_reentrant_call_is_noop(self, mock_scan_view):
+        """A second _start_scanning() while a scan is already in flight must be
+        a no-op: no second worker thread scheduled, no pulse restart, no state
+        re-notification. Otherwise two workers share one Scanner and corrupt the
+        UI/cancellation state (reachable via the manage-profiles 'run' path and
+        the app-level start-scan action, neither of which disables the button).
+        """
+        self._setup_start_mocks(mock_scan_view)
+        mock_scan_view._selected_paths = ["/test/path"]
+        mock_scan_view._is_scanning = True  # a scan is already running
+        callback = mock.MagicMock()
+        mock_scan_view._on_scan_state_changed = callback
+
+        with mock.patch("src.ui.scan_view.GLib") as mock_glib:
+            with mock.patch("src.ui.scan_view.format_scan_path", return_value="/test/path"):
+                mock_scan_view._start_scanning()
+
+        mock_glib.idle_add.assert_not_called()
+        mock_scan_view._start_progress_pulse.assert_not_called()
+        callback.assert_not_called()
+
 
 class TestOnScanClicked:
     """Tests for the _on_scan_clicked handler."""
@@ -1946,23 +2214,21 @@ class TestEicarTest:
         """Test that EICAR test creates a temporary test file."""
         self._setup_eicar_mocks(mock_scan_view)
 
-        with mock.patch("src.ui.scan_view.tempfile") as mock_tempfile:
-            mock_file = mock.MagicMock()
-            mock_file.name = str(tmp_path / "eicar_test.txt")
-            mock_file.__enter__ = mock.MagicMock(return_value=mock_file)
-            mock_file.__exit__ = mock.MagicMock(return_value=False)
-            mock_tempfile.NamedTemporaryFile.return_value = mock_file
-
-            with mock.patch("src.ui.scan_view.is_flatpak", return_value=False):
-                with mock.patch("src.ui.scan_view.GLib"):
-                    with mock.patch("src.ui.scan_view.format_scan_path", return_value="/test"):
-                        mock_scan_view._on_eicar_test_clicked(mock.MagicMock())
+        eicar_path = str(tmp_path / "eicar_test.txt")
+        with mock.patch(
+            "src.ui.scan_view.create_eicar_temp", return_value=eicar_path
+        ) as mock_create:
+            with mock.patch("src.ui.scan_view.register_eicar_atexit_cleanup"):
+                with mock.patch("src.ui.scan_view.is_flatpak", return_value=False):
+                    with mock.patch("src.ui.scan_view.GLib"):
+                        with mock.patch("src.ui.scan_view.format_scan_path", return_value="/test"):
+                            mock_scan_view._on_eicar_test_clicked(mock.MagicMock())
 
             # Verify temp file was created
-            mock_tempfile.NamedTemporaryFile.assert_called_once()
-            call_kwargs = mock_tempfile.NamedTemporaryFile.call_args[1]
-            assert call_kwargs["delete"] is False
-            assert ".txt" in call_kwargs["suffix"]
+            mock_create.assert_called_once()
+            # Non-Flatpak: parent_dir should be None (system default)
+            call_kwargs = mock_create.call_args.kwargs
+            assert call_kwargs.get("parent_dir") is None
 
     def test_eicar_test_uses_cache_dir_in_flatpak(self, mock_scan_view, tmp_path):
         """Test that EICAR test uses ~/.cache/clamui directory in Flatpak.
@@ -1972,39 +2238,43 @@ class TestEicarTest:
         """
         self._setup_eicar_mocks(mock_scan_view)
 
-        with mock.patch("src.ui.scan_view.tempfile") as mock_tempfile:
-            mock_file = mock.MagicMock()
-            mock_file.name = "/home/test/.cache/clamui/eicar_test.txt"
-            mock_file.__enter__ = mock.MagicMock(return_value=mock_file)
-            mock_file.__exit__ = mock.MagicMock(return_value=False)
-            mock_tempfile.NamedTemporaryFile.return_value = mock_file
-
-            with mock.patch("src.ui.scan_view.is_flatpak", return_value=True):
-                with mock.patch("src.ui.scan_view.Path") as mock_path:
-                    mock_home = mock.MagicMock()
-                    mock_cache_dir = mock.MagicMock()
-                    mock_cache_dir.__str__ = mock.MagicMock(return_value="/home/test/.cache/clamui")
-                    mock_home.__truediv__ = mock.MagicMock(return_value=mock_cache_dir)
-                    mock_cache_dir.__truediv__ = mock.MagicMock(return_value=mock_cache_dir)
-                    mock_path.home.return_value = mock_home
-                    with mock.patch("src.ui.scan_view.GLib"):
-                        with mock.patch("src.ui.scan_view.format_scan_path", return_value="/test"):
-                            mock_scan_view._on_eicar_test_clicked(mock.MagicMock())
+        eicar_path = "/home/test/.cache/clamui/eicar_test.txt"
+        with mock.patch(
+            "src.ui.scan_view.create_eicar_temp", return_value=eicar_path
+        ) as mock_create:
+            with mock.patch("src.ui.scan_view.register_eicar_atexit_cleanup"):
+                with mock.patch("src.ui.scan_view.is_flatpak", return_value=True):
+                    with mock.patch("src.ui.scan_view.Path") as mock_path:
+                        mock_home = mock.MagicMock()
+                        mock_cache_dir = mock.MagicMock()
+                        mock_cache_dir.__str__ = mock.MagicMock(
+                            return_value="/home/test/.cache/clamui"
+                        )
+                        mock_home.__truediv__ = mock.MagicMock(return_value=mock_cache_dir)
+                        mock_cache_dir.__truediv__ = mock.MagicMock(return_value=mock_cache_dir)
+                        mock_path.home.return_value = mock_home
+                        with mock.patch("src.ui.scan_view.GLib"):
+                            with mock.patch(
+                                "src.ui.scan_view.format_scan_path", return_value="/test"
+                            ):
+                                mock_scan_view._on_eicar_test_clicked(mock.MagicMock())
 
             # Verify cache dir was used (not /tmp)
-            call_kwargs = mock_tempfile.NamedTemporaryFile.call_args[1]
-            assert call_kwargs["dir"] == "/home/test/.cache/clamui"
+            call_kwargs = mock_create.call_args.kwargs
+            assert call_kwargs["parent_dir"] == "/home/test/.cache/clamui"
 
     def test_eicar_test_handles_oserror(self, mock_scan_view):
         """Test that EICAR test handles OSError gracefully."""
         self._setup_eicar_mocks(mock_scan_view)
 
-        with mock.patch("src.ui.scan_view.tempfile") as mock_tempfile:
-            mock_tempfile.NamedTemporaryFile.side_effect = OSError("Permission denied")
-
-            with mock.patch("src.ui.scan_view.is_flatpak", return_value=False):
-                with mock.patch("src.ui.scan_view.set_status_class"):
-                    mock_scan_view._on_eicar_test_clicked(mock.MagicMock())
+        with mock.patch(
+            "src.ui.scan_view.create_eicar_temp",
+            side_effect=OSError("Permission denied"),
+        ):
+            with mock.patch("src.ui.scan_view.register_eicar_atexit_cleanup"):
+                with mock.patch("src.ui.scan_view.is_flatpak", return_value=False):
+                    with mock.patch("src.ui.scan_view.set_status_class"):
+                        mock_scan_view._on_eicar_test_clicked(mock.MagicMock())
 
             # Should show error in status banner
             mock_scan_view._status_banner.set_title.assert_called()
@@ -2018,20 +2288,32 @@ class TestEicarTest:
         mock_scan_view._set_selected_path = mock.MagicMock()
         mock_scan_view._start_scanning = mock.MagicMock()
 
-        with mock.patch("src.ui.scan_view.tempfile") as mock_tempfile:
-            mock_file = mock.MagicMock()
-            mock_file.name = str(tmp_path / "eicar_test.txt")
-            mock_file.__enter__ = mock.MagicMock(return_value=mock_file)
-            mock_file.__exit__ = mock.MagicMock(return_value=False)
-            mock_tempfile.NamedTemporaryFile.return_value = mock_file
-
-            with mock.patch("src.ui.scan_view.is_flatpak", return_value=False):
-                mock_scan_view._on_eicar_test_clicked(mock.MagicMock())
+        eicar_path = str(tmp_path / "eicar_test.txt")
+        with mock.patch("src.ui.scan_view.create_eicar_temp", return_value=eicar_path):
+            with mock.patch("src.ui.scan_view.register_eicar_atexit_cleanup"):
+                with mock.patch("src.ui.scan_view.is_flatpak", return_value=False):
+                    mock_scan_view._on_eicar_test_clicked(mock.MagicMock())
 
         assert mock_scan_view._scan_backend_override == "daemon"
         assert mock_scan_view._scan_daemon_force_stream is True
-        mock_scan_view._set_selected_path.assert_called_once_with(str(tmp_path / "eicar_test.txt"))
+        mock_scan_view._set_selected_path.assert_called_once_with(eicar_path)
         mock_scan_view._start_scanning.assert_called_once()
+
+    def test_eicar_test_registers_atexit_cleanup_on_create(self, mock_scan_view, tmp_path):
+        """Click handler must register atexit cleanup so a force-quit/crash
+        does not leave the EICAR file lying around (UI-010)."""
+        self._setup_eicar_mocks(mock_scan_view)
+        mock_scan_view._set_selected_path = mock.MagicMock()
+        mock_scan_view._start_scanning = mock.MagicMock()
+
+        eicar_path = str(tmp_path / "eicar_test.txt")
+        with mock.patch("src.ui.scan_view.create_eicar_temp", return_value=eicar_path):
+            with mock.patch("src.ui.scan_view.register_eicar_atexit_cleanup") as mock_register:
+                mock_register.return_value = lambda: None
+                with mock.patch("src.ui.scan_view.is_flatpak", return_value=False):
+                    mock_scan_view._on_eicar_test_clicked(mock.MagicMock())
+
+                mock_register.assert_called_once_with(eicar_path)
 
 
 class TestBackendIndicator:
@@ -2759,6 +3041,8 @@ class TestScanCompleteEicarCleanupError:
         result.infected_count = 0
         result.error_message = None
         result.stderr = ""
+        result.skipped_count = 0
+        result.warning_message = None
 
         with mock.patch("src.ui.scan_view.ScanStatus") as mock_scan_status:
             mock_scan_status.CLEAN = clean_status
@@ -2871,3 +3155,126 @@ class TestScanViewSharedQuarantineManager:
             assert view._quarantine_manager is mock_qm_instance
         finally:
             sv_module.QuarantineManager = original_qm
+
+
+class TestIsScanningProperty:
+    """Tests for the public is_scanning property used by app.py."""
+
+    def test_is_scanning_false_when_idle(self, mock_scan_view):
+        """The property mirrors the private _is_scanning flag (idle)."""
+        mock_scan_view._is_scanning = False
+
+        assert mock_scan_view.is_scanning is False
+
+    def test_is_scanning_true_while_scanning(self, mock_scan_view):
+        """The property mirrors the private _is_scanning flag (scanning)."""
+        mock_scan_view._is_scanning = True
+
+        assert mock_scan_view.is_scanning is True
+
+
+# =============================================================================
+# Composition-root ScanView (src/ui/scan/scan_view.py) Tests
+# =============================================================================
+
+
+@pytest.fixture
+def composition_scan_view_class(mock_gi_modules):
+    """Get the composition-root scan.ScanView class with mocked dependencies."""
+    with mock.patch.dict(
+        sys.modules,
+        {
+            "src.core.scanner": mock.MagicMock(),
+            "src.core.quarantine": mock.MagicMock(),
+            "src.core.settings_manager": mock.MagicMock(),
+            "src.core.utils": mock.MagicMock(),
+            "src.ui.compat": mock.MagicMock(),
+            "src.ui.scan_results_dialog": mock.MagicMock(),
+            "src.ui.view_helpers": mock.MagicMock(),
+            "src.ui.scan.profile_selector": mock.MagicMock(),
+            "src.ui.scan.scan_controller": mock.MagicMock(),
+            "src.ui.scan.scan_progress_widget": mock.MagicMock(),
+            "src.ui.scan.scan_results_widget": mock.MagicMock(),
+            "src.ui.scan.target_selector": mock.MagicMock(),
+        },
+    ):
+        for cached in ("src.ui.scan", "src.ui.scan.scan_view"):
+            if cached in sys.modules:
+                del sys.modules[cached]
+
+        from src.ui.scan.scan_view import ScanView as CompositionScanView
+
+        yield CompositionScanView
+
+    _clear_src_modules()
+
+
+@pytest.fixture
+def composition_scan_view(composition_scan_view_class):
+    """Create a composition-root ScanView instance without running __init__."""
+    view = object.__new__(composition_scan_view_class)
+    view._target_selector = mock.MagicMock()
+    view._controller = mock.MagicMock()
+    return view
+
+
+class TestCompositionRootScanView:
+    """Switchover-parity tests for the composition-root scan.ScanView."""
+
+    def test_replace_selected_paths_delegates_to_target_selector(self, composition_scan_view):
+        """_replace_selected_paths must exist and delegate to set_paths.
+
+        Regression: app.py calls scan_view._replace_selected_paths(paths) for
+        multi-target CLI scans, but the designated replacement view lacked the
+        method entirely (AttributeError on switchover).
+        """
+        composition_scan_view._replace_selected_paths(["/tmp/a.pdf", "/tmp/b.pdf"])
+
+        composition_scan_view._target_selector.set_paths.assert_called_once_with(
+            ["/tmp/a.pdf", "/tmp/b.pdf"]
+        )
+
+    def test_is_scanning_mirrors_controller_state(self, composition_scan_view):
+        """The public is_scanning property mirrors the controller state."""
+        composition_scan_view._controller.is_scanning = True
+        assert composition_scan_view.is_scanning is True
+
+        composition_scan_view._controller.is_scanning = False
+        assert composition_scan_view.is_scanning is False
+
+    def test_setup_controller_wires_log_manager_into_scanner(self, composition_scan_view_class):
+        """The Scanner must receive the shared log_manager like the live view.
+
+        Regression: the composition root built Scanner without log_manager
+        while src/ui/scan_view.py passes one, so scan logs would use a
+        redundant LogManager instance after switchover.
+        """
+        view = object.__new__(composition_scan_view_class)
+        view._log_manager = mock.MagicMock(name="shared_log_manager")
+        view._settings_manager = mock.MagicMock(name="settings_manager")
+
+        sv_module = sys.modules["src.ui.scan.scan_view"]
+        with (
+            mock.patch.object(sv_module, "Scanner") as mock_scanner_class,
+            mock.patch.object(sv_module, "ScanController") as mock_controller_class,
+        ):
+            view._setup_controller()
+
+        mock_scanner_class.assert_called_once_with(
+            log_manager=view._log_manager, settings_manager=view._settings_manager
+        )
+        mock_controller_class.assert_called_once_with(
+            mock_scanner_class.return_value, view._settings_manager
+        )
+
+    def test_init_accepts_log_manager_keyword(self, composition_scan_view_class):
+        """__init__ stores the log_manager for the controller wiring."""
+        log_manager = mock.MagicMock(name="log_manager")
+
+        view = composition_scan_view_class(
+            settings_manager=mock.MagicMock(),
+            quarantine_manager=mock.MagicMock(),
+            log_manager=log_manager,
+        )
+
+        assert view._log_manager is log_manager

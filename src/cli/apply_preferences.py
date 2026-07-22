@@ -2,46 +2,65 @@
 """
 Helper command for applying configuration files with elevated privileges.
 
-This CLI is intended to be invoked via pkexec by the GUI layer. It copies
-staged config files to their destination paths and normalizes permissions.
+This CLI is intended to be invoked via ``pkexec`` by the GUI layer.  It is
+deliberately small, has no GTK dependency, and treats every input as
+adversarial.  See ``src/core/privileged_paths.py`` for the validators that
+form the actual security boundary; this module is the wiring around them.
+
+Protocol (version 2):
+
+    PKEXEC_UID=<uid>  pkexec  clamui-apply-preferences  --protocol=2 \\
+        <staged-src-1> <dest-1>  [<staged-src-2> <dest-2> ...]
+
+The helper:
+
+1. Reads ``PKEXEC_UID`` from the environment; refuses if missing, ``0``,
+   or non-numeric (exit 3).  This pins source-file authentication to the
+   user who actually authorised the elevation, not to the running root
+   process.
+2. Requires ``--protocol=2`` as the first positional argument so an
+   outdated caller paired with the hardened helper fails closed (exit 4)
+   instead of being interpreted as ``src dest src dest ...``.
+3. Resolves the per-user staging root, opens it ``O_NOFOLLOW`` /
+   ``O_DIRECTORY``, and verifies it is owned by the calling UID with
+   mode ``0o700`` (or stricter).
+4. For each ``(src, dst)`` pair:
+
+   - Opens ``src`` with ``O_RDONLY | O_NOFOLLOW | O_NONBLOCK`` (refuses
+     symlinks atomically, refuses to block on FIFOs).
+   - ``fstat``s the descriptor and confirms regular-file, owning UID,
+     no group/world write, resolved path under the staging root.
+   - Validates the destination against the allowlist (``.conf`` extension,
+     no traversal, parent must be one of the allowed dirs after symlink
+     resolution).
+   - Atomically installs via ``mkstemp`` in the destination directory,
+     ``copyfileobj`` from the validated FD, ``fsync``, ``chmod 0o644``,
+     ``os.replace`` onto the destination.  On any error the temp file is
+     unlinked.
+
+5. Restarts any active ClamAV systemd units affected by the writes.
 """
 
+from __future__ import annotations
+
+import logging
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
-
-def _parse_path_pairs(args: list[str]) -> list[tuple[Path, Path]]:
-    """
-    Parse command arguments into (source, destination) path pairs.
-
-    Args:
-        args: Flat list of alternating source and destination paths
-
-    Returns:
-        List of (source, destination) Path tuples
-
-    Raises:
-        ValueError: If args are empty or not provided as pairs
-    """
-    if not args:
-        raise ValueError("No staged configuration files were provided.")
-    if len(args) % 2 != 0:
-        raise ValueError("Invalid arguments: expected source/destination path pairs.")
-
-    pairs = []
-    for idx in range(0, len(args), 2):
-        pairs.append((Path(args[idx]), Path(args[idx + 1])))
-    return pairs
-
-
-_ALLOWED_DEST_DIRS: tuple[Path, ...] = (
-    Path("/etc/clamav"),
-    Path("/etc/clamd.d"),
-    Path("/etc/clamav-unofficial-sigs"),
+from ..core.privileged_paths import (
+    PROTOCOL_VERSION,
+    staging_root_for_uid,
+    validate_destination,
+    validate_source_for_uid,
+    verify_staging_root,
 )
+
+logger = logging.getLogger(__name__)
+
 
 _FRESHCLAM_UNITS: tuple[str, ...] = (
     "clamav-freshclam.service",
@@ -56,47 +75,141 @@ _CLAMD_UNITS: tuple[str, ...] = (
 )
 
 
-def _validate_destination(destination: Path) -> None:
-    """
-    Validate that a destination path is within the ClamAV config allowlist.
+# --- Exit codes -----------------------------------------------------------
+# 0  success
+# 1  generic error (validation failure, IO error, restart failure)
+# 2  argument parsing error (odd number of pairs, no pairs)
+# 3  PKEXEC_UID missing/zero/non-numeric
+# 4  protocol mismatch (caller did not pass --protocol=2 first)
+EXIT_OK = 0
+EXIT_GENERIC_ERROR = 1
+EXIT_BAD_ARGS = 2
+EXIT_BAD_PKEXEC_UID = 3
+EXIT_BAD_PROTOCOL = 4
 
-    The resolved path must:
-    - Have a parent directory that exactly matches one of the allowed directories
-    - End with a ``.conf`` extension
+
+def _parse_path_pairs(args: list[str]) -> list[tuple[Path, Path]]:
+    """
+    Parse remaining arguments into ``(source, destination)`` path pairs.
 
     Args:
-        destination: Proposed destination file path
+        args: Flat list of alternating source and destination paths
+            (after the ``--protocol=2`` token has been consumed).
+
+    Returns:
+        List of ``(source, destination)`` ``Path`` tuples.
 
     Raises:
-        ValueError: If the destination is outside the allowlist or has a
-            disallowed extension
+        ValueError: If args are empty or not provided as pairs.
     """
-    resolved = destination.resolve()
+    if not args:
+        raise ValueError("No staged configuration files were provided.")
+    if len(args) % 2 != 0:
+        raise ValueError("Invalid arguments: expected source/destination path pairs.")
 
-    if resolved.suffix != ".conf":
-        raise ValueError(f"Destination must have a .conf extension: {resolved}")
+    pairs: list[tuple[Path, Path]] = []
+    for idx in range(0, len(args), 2):
+        pairs.append((Path(args[idx]), Path(args[idx + 1])))
+    return pairs
 
-    if resolved.parent not in _ALLOWED_DEST_DIRS:
-        raise ValueError(f"Destination is not in allowed config directories: {resolved}")
+
+def _parse_pkexec_uid() -> int | None:
+    """Return ``PKEXEC_UID`` as an int, or ``None`` if missing/zero/invalid."""
+    raw = os.environ.get("PKEXEC_UID")
+    if raw is None:
+        return None
+    try:
+        uid = int(raw)
+    except ValueError:
+        return None
+    if uid <= 0:
+        return None
+    return uid
 
 
-def _apply_config_file(source: Path, destination: Path) -> None:
+def _resolve_staging_root(uid: int) -> Path:
+    """Indirection seam so tests can redirect the staging root under tmp_path."""
+    return staging_root_for_uid(uid)
+
+
+def _atomic_install(source_fd: int, destination: Path) -> None:
     """
-    Copy one staged config file to destination and set expected permissions.
+    Atomically install ``source_fd``'s content into ``destination`` (mode 0o644).
+
+    The temp file is created in the *destination* directory so ``os.replace``
+    is a same-filesystem rename and therefore atomic.  Any failure unlinks
+    the temp file before re-raising; the destination is never left in a
+    partially-written state.
 
     Args:
-        source: Staged temporary file path
-        destination: Final config file destination path
+        source_fd: Validated, ``O_NOFOLLOW``-opened source descriptor.  This
+            function takes ownership and closes it via ``os.fdopen``.
+        destination: Final destination path.  The parent must already exist.
     """
-    if not source.exists():
-        raise FileNotFoundError(f"Staged file not found: {source}")
-    if not source.is_file():
-        raise OSError(f"Staged path is not a file: {source}")
+    dst_dir = destination.parent
+    dst_dir.mkdir(parents=True, exist_ok=True)
 
-    _validate_destination(destination)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, destination)
-    os.chmod(destination, 0o644)
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        dir=str(dst_dir),
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+    )
+    try:
+        with (
+            os.fdopen(source_fd, "rb", closefd=True) as src_f,
+            os.fdopen(tmp_fd, "wb", closefd=True) as tmp_f,
+        ):
+            shutil.copyfileobj(src_f, tmp_f)
+            tmp_f.flush()
+            os.fsync(tmp_f.fileno())
+        os.chmod(tmp_name, 0o644)
+        os.replace(tmp_name, destination)
+    except BaseException:
+        # If anything went wrong, make sure no half-written file lingers.
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _apply_pair(
+    source: Path,
+    destination: Path,
+    expected_uid: int,
+    staging_root: Path,
+) -> None:
+    """
+    Validate one ``(source, destination)`` pair and install it atomically.
+
+    Args:
+        source: Staged file path (must live under ``staging_root``).
+        destination: Final destination path (must satisfy the allowlist).
+        expected_uid: UID that must own ``source`` (typically ``PKEXEC_UID``).
+        staging_root: Per-invocation staging directory.
+
+    Raises:
+        ValueError: On any validation failure.
+        OSError: From ``os.open`` (e.g. ``ELOOP`` for a symlink source).
+    """
+    # Validate destination FIRST so a bad destination short-circuits before
+    # we even open the source file.  Fail-fast ordering also matters for
+    # multi-pair atomicity: see ``main`` where every pair is validated
+    # before any pair is installed.
+    validate_destination(destination)
+
+    src_fd = os.open(
+        str(source),
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+    )
+    try:
+        validate_source_for_uid(src_fd, source, expected_uid, staging_root)
+    except BaseException:
+        os.close(src_fd)
+        raise
+
+    # _atomic_install takes ownership of src_fd and closes it.
+    _atomic_install(src_fd, destination)
 
 
 def _restart_units_for_destinations(destinations: list[Path]) -> None:
@@ -107,7 +220,7 @@ def _restart_units_for_destinations(destinations: list[Path]) -> None:
     are skipped without failing the save operation.
 
     Args:
-        destinations: Final config destinations that were updated
+        destinations: Final config destinations that were updated.
     """
     if shutil.which("systemctl") is None:
         return
@@ -139,39 +252,75 @@ def _restart_units_for_destinations(destinations: list[Path]) -> None:
             text=True,
         )
         if restart_result.returncode != 0:
-            error = restart_result.stderr.strip() or restart_result.stdout.strip() or "unknown error"
+            error = (
+                restart_result.stderr.strip() or restart_result.stdout.strip() or "unknown error"
+            )
             raise RuntimeError(f"Failed to restart {unit}: {error}")
 
 
 def main(argv: list[str] | None = None) -> int:
     """
-    Entry point for privileged preferences apply helper.
+    Entry point for the privileged preferences apply helper.
 
     Args:
-        argv: Optional argument list (defaults to sys.argv[1:])
+        argv: Optional argument list (defaults to ``sys.argv[1:]``).
 
     Returns:
-        Exit status code (0 success, non-zero on failure)
+        Exit status code.  See module docstring for the meaning of each code.
     """
     args = list(sys.argv[1:] if argv is None else argv)
+
+    uid = _parse_pkexec_uid()
+    if uid is None:
+        print(
+            "Error: PKEXEC_UID is missing or invalid; refusing to run.",
+            file=sys.stderr,
+        )
+        return EXIT_BAD_PKEXEC_UID
+
+    expected_protocol = f"--protocol={PROTOCOL_VERSION}"
+    if not args or args[0] != expected_protocol:
+        print(
+            f"Error: missing or wrong protocol token; expected {expected_protocol} as the "
+            "first argument.",
+            file=sys.stderr,
+        )
+        return EXIT_BAD_PROTOCOL
+    args = args[1:]
 
     try:
         pairs = _parse_path_pairs(args)
     except ValueError as error:
         print(f"Error: {error}", file=sys.stderr)
-        return 2
+        return EXIT_BAD_ARGS
+
+    staging_root = _resolve_staging_root(uid)
+    try:
+        verify_staging_root(staging_root, uid)
+    except (ValueError, OSError) as error:
+        print(f"Error: invalid staging root: {error}", file=sys.stderr)
+        return EXIT_GENERIC_ERROR
+
+    # Two-phase: validate every pair before installing any pair.  If pair #2
+    # has a bad destination we must NOT have installed pair #1 yet.
+    try:
+        for _source, destination in pairs:
+            validate_destination(destination)
+    except ValueError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return EXIT_GENERIC_ERROR
 
     try:
         destinations: list[Path] = []
         for source, destination in pairs:
-            _apply_config_file(source, destination)
+            _apply_pair(source, destination, uid, staging_root)
             destinations.append(destination)
         _restart_units_for_destinations(destinations)
     except Exception as error:
         print(f"Error: {error}", file=sys.stderr)
-        return 1
+        return EXIT_GENERIC_ERROR
 
-    return 0
+    return EXIT_OK
 
 
 if __name__ == "__main__":

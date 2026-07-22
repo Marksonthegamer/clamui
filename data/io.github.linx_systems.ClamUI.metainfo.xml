@@ -31,35 +31,39 @@
     <screenshots>
         <screenshot type="default">
             <caption>Main application window</caption>
-            <image>https://github.com/linx-systems/clamui/raw/v0.1.6/screenshots/main_view.png</image>
+            <image>https://github.com/linx-systems/clamui/raw/v0.1.7/screenshots/main_view.png</image>
         </screenshot>
         <screenshot>
             <caption>Scan results display</caption>
-            <image>https://github.com/linx-systems/clamui/raw/v0.1.6/screenshots/main_view_with_scan_result.png</image>
+            <image>https://github.com/linx-systems/clamui/raw/v0.1.7/screenshots/main_view_with_scan_result.png</image>
         </screenshot>
         <screenshot>
             <caption>Analysis view</caption>
-            <image>https://github.com/linx-systems/clamui/raw/v0.1.6/screenshots/analysis_view.png</image>
+            <image>https://github.com/linx-systems/clamui/raw/v0.1.7/screenshots/analysis_view.png</image>
         </screenshot>
         <screenshot>
             <caption>Components view</caption>
-            <image>https://github.com/linx-systems/clamui/raw/v0.1.6/screenshots/components_view.png</image>
+            <image>https://github.com/linx-systems/clamui/raw/v0.1.7/screenshots/components_view.png</image>
+        </screenshot>
+        <screenshot>
+            <caption>System security audit</caption>
+            <image>https://github.com/linx-systems/clamui/raw/v0.1.7/screenshots/audit_view.png</image>
         </screenshot>
         <screenshot>
             <caption>Configuration settings</caption>
-            <image>https://github.com/linx-systems/clamui/raw/v0.1.6/screenshots/config_view.png</image>
+            <image>https://github.com/linx-systems/clamui/raw/v0.1.7/screenshots/config_view.png</image>
         </screenshot>
         <screenshot>
             <caption>Scan history</caption>
-            <image>https://github.com/linx-systems/clamui/raw/v0.1.6/screenshots/history_view.png</image>
+            <image>https://github.com/linx-systems/clamui/raw/v0.1.7/screenshots/history_view.png</image>
         </screenshot>
         <screenshot>
             <caption>Profile management</caption>
-            <image>https://github.com/linx-systems/clamui/raw/v0.1.6/screenshots/profile_management.png</image>
+            <image>https://github.com/linx-systems/clamui/raw/v0.1.7/screenshots/profile_management.png</image>
         </screenshot>
         <screenshot>
             <caption>Quarantine management</caption>
-            <image>https://github.com/linx-systems/clamui/raw/v0.1.6/screenshots/quarantine_view.png</image>
+            <image>https://github.com/linx-systems/clamui/raw/v0.1.7/screenshots/quarantine_view.png</image>
         </screenshot>
     </screenshots>
 
@@ -96,6 +100,71 @@
     </keywords>
 
     <releases>
+        <release version="0.3.0" date="2026-06-26">
+            <description>
+                <p>Privileged configuration helper, Flatpak host-config fixes, CLI scan reliability, and security hardening</p>
+                <ul>
+                    <li>Add the `clamui install-privileged-helper` CLI path and skip unnecessary elevation prompts when ClamUI already runs as root</li>
+                    <li>Persist Flatpak ClamAV configuration preferences through the host helper and fix elevation decisions, audit database date handling, and benign size-limit scan warnings</li>
+                    <li>Fix CLI and scheduled scans so saved backend/exclusion settings are honored and every CLI-provided path is scanned</li>
+                    <li>Harden terminal output, profile import handling, scheduler quoting, sanitizer coverage, quarantine cleanup, and audit verdicts against malformed or misleading inputs</li>
+                    <li>Improve VirusTotal retries, large-upload handling, engine-result counting, tray resynchronization, and AppImage environment cleanup</li>
+                    <li>Refresh Python, Flatpak, website, and translation assets, and add a real-GTK construction smoke test for release validation</li>
+                </ul>
+            </description>
+        </release>
+        <release version="0.2.0" date="2026-05-28">
+            <description>
+                <p>Portmaster privacy-filter audit, quarantine restore hardening, and scanner reliability fixes</p>
+                <ul>
+                    <li>Add an optional Portmaster privacy-filter check to the security audit that reports running, installed, or not-installed status and per-module health without affecting summary counts when Portmaster is absent</li>
+                    <li>Harden quarantine restore handling against unsafe path and metadata manipulation (GHSA-xhhj-qvvr-vhwq)</li>
+                    <li>Fix full scans hanging mid-run by draining ClamAV stderr concurrently with stdout so the scanner no longer deadlocks on a full pipe buffer</li>
+                    <li>Improve system-tray compatibility under Flatpak and stricter StatusNotifierItem hosts (Plasma 6, Ayatana, xapp-sn-watcher) with ARGB icon fallbacks and attention-icon handling</li>
+                    <li>Document installation via AppMan / AM in the install guide</li>
+                    <li>Refresh Python and Flatpak runtime dependencies, including cryptography, urllib3, certifi, packaging, and PyGObject</li>
+                </ul>
+            </description>
+        </release>
+        <release version="0.1.8" date="2026-05-07">
+            <description>
+                <p>Security hardening, Flatpak host-ClamAV fixes, tray reliability, and Spanish translation support</p>
+                <ul>
+                    <li>Harden privileged ClamAV config saving with UID-checked staging, source validation, destination allowlisting, and atomic installs</li>
+                    <li>Prevent scan path arguments from being interpreted as ClamAV command-line flags</li>
+                    <li>Mask quarantine restore permissions to regular mode bits, reject symlink restore destinations, and avoid restoring setuid, setgid, or sticky bits</li>
+                    <li>Protect scheduled-scan crontab updates from deleting unrelated user entries</li>
+                    <li>Require host ClamAV tools for Flatpak and improve host config, detection, updater, and audit behavior from the sandbox</li>
+                    <li>Fix Flatpak daemon file-list scans with host-visible paths</li>
+                    <li>Refresh Python dependency locks and Flatpak runtime pins including cryptography, packaging, and more-itertools</li>
+                    <li>Fix updater gettext error handling, scanner EOF CPU spinning, tray profile updates, tray crash recovery, removable-device scan requeues, EICAR temp cleanup, statistics timestamp parsing, and VirusTotal UTC timestamps</li>
+                    <li>Add Spanish translation support</li>
+                    <li>Add draft GitHub release workflow and refresh CI/action dependencies</li>
+                </ul>
+            </description>
+        </release>
+        <release version="0.1.7" date="2026-04-21">
+            <description>
+                <p>System security audit, Flatpak hardening, AppImage delta updates, and tray reliability</p>
+                <ul>
+                    <li>Add system security audit dashboard with firewall, MAC, SSH, rootkit, and ClamAV health checks</li>
+                    <li>Notify when the security audit finds issues and add info links for each check</li>
+                    <li>Add AppImage delta update support via zsync</li>
+                    <li>Add French and Italian translations and refresh German and Chinese (zh_CN) strings</li>
+                    <li>Add an in-app language override so users can pick the interface language regardless of system locale</li>
+                    <li>Address OWASP audit findings across scanner, updater, and logging paths</li>
+                    <li>Improve scan detail UX and GUI shutdown behavior</li>
+                    <li>Fix Plasma tray watcher registration timing and StartupWMClass for window matching</li>
+                    <li>Fix Fedora clamd detection and status checks</li>
+                    <li>Make folder opening, file dialogs, and app launching Flatpak-aware</li>
+                    <li>Handle non-UTF-8 filenames and filter non-fatal LibClamAV errors during scans</li>
+                    <li>Escape Pango markup in widget titles and clamp scan progress overflow</li>
+                    <li>Defer panel data loading and share LogManager across views for faster startup</li>
+                    <li>Restart ClamAV services after applying config changes and repair config duplication</li>
+                    <li>Refresh cryptography, certifi, and pytest pins (pytest &gt;=9.0.3 for CVE-2025-71176)</li>
+                </ul>
+            </description>
+        </release>
         <release version="0.1.6" date="2026-04-03">
             <description>
                 <p>Security hardening, scanner reliability fixes, and release pipeline updates</p>

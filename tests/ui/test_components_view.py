@@ -210,6 +210,32 @@ class TestCheckComponents:
         mock_clam.assert_not_called()
         _clear_src_modules()
 
+    @patch("src.ui.components_view.check_clamav_installed")
+    def test_check_background_failure_still_schedules_ui_reset(self, mock_clam, mock_gi_modules):
+        """A raising check must not strand the spinner.
+
+        Without a try/finally the worker thread dies before scheduling the UI
+        update, so _set_checking_state(False) never runs and the spinner spins
+        forever. The UI reset must still be scheduled with whatever results
+        were collected (here: none).
+        """
+        import src.ui.components_view as cv
+
+        ComponentsView, *_ = _import_view(mock_gi_modules)
+        view = _create_view(ComponentsView)
+        view._is_checking = True
+
+        mock_clam.side_effect = RuntimeError("subprocess blew up")
+
+        with patch.object(cv, "GLib") as mock_glib:
+            # Must not propagate the exception out of the worker.
+            view._check_components_background()
+            # The main-thread UI update (which resets the checking state) is
+            # still scheduled, with partial/empty results.
+            mock_glib.idle_add.assert_called_once_with(view._update_components_ui, {})
+
+        _clear_src_modules()
+
 
 class TestSetCheckingState:
     """Test _set_checking_state UI updates."""
@@ -297,28 +323,28 @@ class TestUpdateComponentStatus:
         _clear_src_modules()
 
     @patch("src.ui.components_view.is_flatpak", return_value=True)
-    def test_installed_flatpak_bundled(self, mock_flatpak, mock_gi_modules):
+    def test_installed_flatpak_host_component(self, mock_flatpak, mock_gi_modules):
         ComponentsView, *_ = _import_view(mock_gi_modules)
         view = _create_view(ComponentsView)
         _populate_component_widgets(view, "clamscan")
 
         view._update_component_status("clamscan", True, "ClamAV 1.0.0")
 
-        view._status_labels["clamscan"].set_text.assert_called_with("Bundled")
-        view._component_rows["clamscan"].set_subtitle.assert_called_with("Included with Flatpak")
+        view._status_labels["clamscan"].set_text.assert_called_with("Installed")
+        view._component_rows["clamscan"].set_subtitle.assert_called_with("ClamAV 1.0.0")
         _clear_src_modules()
 
     @patch("src.ui.components_view.is_flatpak", return_value=True)
-    def test_not_installed_flatpak_bundled_shows_error(self, mock_flatpak, mock_gi_modules):
-        """Flatpak-bundled components that aren't found indicate a package issue."""
+    def test_not_installed_flatpak_host_component_shows_setup(self, mock_flatpak, mock_gi_modules):
+        """Flatpak host components that aren't found should show setup instructions."""
         ComponentsView, *_ = _import_view(mock_gi_modules)
         view = _create_view(ComponentsView)
         _populate_component_widgets(view, "clamscan")
 
         view._update_component_status("clamscan", False, "Not found")
 
-        view._status_labels["clamscan"].set_text.assert_called_with("Unavailable")
-        view._component_rows["clamscan"].set_enable_expansion.assert_called_with(False)
+        view._status_labels["clamscan"].set_text.assert_called_with("Not installed")
+        view._component_rows["clamscan"].set_enable_expansion.assert_called_with(True)
         _clear_src_modules()
 
     @patch("src.ui.components_view.is_flatpak", return_value=True)
@@ -508,30 +534,8 @@ class TestFlatpakBehavior:
     """Test Flatpak-specific behaviour."""
 
     @patch("src.ui.components_view.is_flatpak", return_value=True)
-    def test_add_flatpak_bundled_message_clamscan(self, mock_flatpak, mock_gi_modules):
-        ComponentsView, *_ = _import_view(mock_gi_modules)
-        view = _create_view(ComponentsView)
-        content_box = MagicMock()
-
-        view._add_flatpak_bundled_message(content_box, "clamscan")
-
-        content_box.append.assert_called_once()
-        _clear_src_modules()
-
-    @patch("src.ui.components_view.is_flatpak", return_value=True)
-    def test_add_flatpak_bundled_message_freshclam(self, mock_flatpak, mock_gi_modules):
-        ComponentsView, *_ = _import_view(mock_gi_modules)
-        view = _create_view(ComponentsView)
-        content_box = MagicMock()
-
-        view._add_flatpak_bundled_message(content_box, "freshclam")
-
-        content_box.append.assert_called_once()
-        _clear_src_modules()
-
-    @patch("src.ui.components_view.is_flatpak", return_value=True)
-    def test_add_setup_guide_flatpak_bundled_component(self, mock_flatpak, mock_gi_modules):
-        """Flatpak-bundled components should get a bundled message instead of install commands."""
+    def test_add_setup_guide_flatpak_host_component(self, mock_flatpak, mock_gi_modules):
+        """Flatpak host components should get install commands."""
         ComponentsView, *_ = _import_view(mock_gi_modules)
         view = _create_view(ComponentsView)
         expander = MagicMock()

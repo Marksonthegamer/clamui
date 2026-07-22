@@ -1,6 +1,7 @@
 # ClamUI Daemon Scanner Tests
 """Unit tests for the daemon scanner module."""
 
+import stat
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -240,6 +241,23 @@ Infected files: 0
         assert result.infected_count == 0
         assert result.scanned_files == 1
 
+    def test_parse_results_file_list_error_with_zero_exit_is_error(
+        self, daemon_scanner_class, scan_status_class
+    ):
+        """clamdscan can return 0 after failing to open --file-list."""
+        scanner = daemon_scanner_class()
+        stdout = """
+ERROR: --file-list: Can't open file /run/user/1000/clamui_filelist.txt
+
+----------- SCAN SUMMARY -----------
+Infected files: 0
+"""
+
+        result = scanner._parse_results("/home/user", stdout, "", 0, file_count=0, dir_count=0)
+
+        assert result.status == scan_status_class.ERROR
+        assert "--file-list" in result.error_message
+
     def test_parse_results_infected_scan(self, daemon_scanner_class, scan_status_class):
         """Test parsing infected scan results."""
         scanner = daemon_scanner_class()
@@ -278,7 +296,7 @@ Infected files: 1
 /home/user/a.txt: File path check failure: Permission denied. ERROR
 /home/user/b.txt: File path check failure: Permission denied. ERROR
 """
-        result = scanner._parse_results("/home/user", stdout, "", 2, file_count=2, dir_count=0)
+        result = scanner._parse_results("/home/user", stdout, "", 2, file_count=3, dir_count=0)
 
         assert result.status == scan_status_class.CLEAN
         assert result.infected_count == 0
@@ -295,7 +313,7 @@ Infected files: 1
 /home/user/a.txt: File path check failure: Permission denied. ERROR
 /home/user/a.txt: File path check failure: Permission denied. ERROR
 """
-        result = scanner._parse_results("/home/user", stdout, "", 2, file_count=1, dir_count=0)
+        result = scanner._parse_results("/home/user", stdout, "", 2, file_count=2, dir_count=0)
 
         assert result.status == scan_status_class.CLEAN
         assert result.skipped_count == 1
@@ -313,7 +331,7 @@ LibClamAV Warning: cli_realpath: Invalid arguments.
 WARNING: /home/user/.cache/steam_pipe: Not supported file type
 LibClamAV Warning: cli_realpath: Invalid arguments.
 """
-        result = scanner._parse_results("/home/user", stdout, "", 2, file_count=2, dir_count=0)
+        result = scanner._parse_results("/home/user", stdout, "", 2, file_count=3, dir_count=0)
 
         assert result.status == scan_status_class.CLEAN
         assert result.infected_count == 0
@@ -323,6 +341,187 @@ LibClamAV Warning: cli_realpath: Invalid arguments.
             "/home/user/.cache/steam_pipe",
         ]
         assert result.warning_message == "2 file(s) could not be accessed"
+
+    def test_parse_results_all_files_skipped_is_error(
+        self, daemon_scanner_class, scan_status_class
+    ):
+        """Exit 2 where every pre-counted file was inaccessible must not report CLEAN."""
+        scanner = daemon_scanner_class()
+
+        stdout = "".join(f"/root/secret{i}.txt: Access denied. ERROR\n" for i in range(1, 6))
+        result = scanner._parse_results("/root", stdout, "", 2, file_count=5, dir_count=1)
+
+        assert result.status == scan_status_class.ERROR
+        assert result.error_message == "No files could be scanned"
+        assert result.skipped_count == 5
+
+    def test_parse_results_all_skipped_without_precount_still_downgrades(
+        self, daemon_scanner_class, scan_status_class
+    ):
+        """With counting disabled (file_count=0) skip warnings still downgrade to CLEAN."""
+        scanner = daemon_scanner_class()
+
+        stdout = "/root/secret.txt: Access denied. ERROR\n"
+        result = scanner._parse_results("/root", stdout, "", 2, file_count=0, dir_count=0)
+
+        assert result.status == scan_status_class.CLEAN
+        assert result.skipped_files == ["/root/secret.txt"]
+        assert result.warning_message == "1 file(s) could not be accessed"
+
+    def test_parse_results_total_errors_covering_precount_is_error(
+        self, daemon_scanner_class, scan_status_class
+    ):
+        """'Total errors' matching the pre-count means every file failed -> ERROR."""
+        scanner = daemon_scanner_class()
+
+        stdout = """
+----------- SCAN SUMMARY -----------
+Infected files: 0
+Total errors: 4
+"""
+        result = scanner._parse_results("/root", stdout, "", 2, file_count=4, dir_count=1)
+
+        assert result.status == scan_status_class.ERROR
+        assert result.error_message == "No files could be scanned"
+
+    def test_parse_results_exit_code_2_with_detection_is_infected(
+        self, daemon_scanner_class, scan_status_class
+    ):
+        """Detections must win over a co-occurring error: exit 2 + FOUND -> INFECTED."""
+        scanner = daemon_scanner_class()
+
+        stdout = """
+/home/user/eicar.txt: Eicar-Test-Signature FOUND
+/home/user/locked.bin: Can't open file or directory ERROR
+"""
+        result = scanner._parse_results("/home/user", stdout, "", 2, file_count=2, dir_count=0)
+
+        assert result.status == scan_status_class.INFECTED
+        assert result.infected_count == 1
+        assert "/home/user/eicar.txt" in result.infected_files
+
+    def test_parse_results_issue_149_warning_lines_exit_2_clean(
+        self, daemon_scanner_class, scan_status_class
+    ):
+        """Regression for issue #149: the exact benign LibClamAV warnings from the
+        report must not flip an exit-2 daemon scan to ERROR."""
+        scanner = daemon_scanner_class()
+
+        stdout = """
+----------- SCAN SUMMARY -----------
+Infected files: 0
+"""
+        stderr = (
+            "LibClamAV Warning: cli_tnef: file truncated, returning CLEAN\n"
+            "LibClamAV Warning: cli_scanxz: decompress file size exceeds limits - "
+            "only scanning 105906176 bytes\n"
+        )
+
+        result = scanner._parse_results(
+            "/home/user", stdout, stderr, 2, file_count=100, dir_count=3
+        )
+
+        assert result.status == scan_status_class.CLEAN
+        assert result.error_message is None
+        assert result.nonfatal_warnings == [
+            "LibClamAV Warning: cli_tnef: file truncated, returning CLEAN",
+            "LibClamAV Warning: cli_scanxz: decompress file size exceeds limits - "
+            "only scanning 105906176 bytes",
+        ]
+        assert result.has_warnings is True
+        assert result.warning_message == (
+            "2 non-fatal warning(s) during scan; some files may have been only partially scanned"
+        )
+
+    def test_parse_results_exit_0_with_stray_warning_stays_clean(
+        self, daemon_scanner_class, scan_status_class
+    ):
+        """A stray unrecognized warning line must not override the daemon's exit 0."""
+        scanner = daemon_scanner_class()
+
+        stdout = """
+/home/user/test.txt: OK
+
+----------- SCAN SUMMARY -----------
+Infected files: 0
+"""
+        stderr = "LibClamAV Warning: something novel happened\n"
+
+        result = scanner._parse_results("/home/user", stdout, stderr, 0, file_count=1, dir_count=0)
+
+        assert result.status == scan_status_class.CLEAN
+        assert result.error_message is None
+
+    def test_parse_results_exit_0_unrar_dlopen_warning_is_clean(
+        self, daemon_scanner_class, scan_status_class
+    ):
+        """The verified 'Cannot dlopen libclamunrar_iface' warning at exit 0 -> CLEAN."""
+        scanner = daemon_scanner_class()
+
+        stderr = (
+            "LibClamAV Warning: Cannot dlopen libclamunrar_iface: file not found, "
+            "unrar support unavailable\n"
+        )
+
+        result = scanner._parse_results("/home/user", "", stderr, 0, file_count=1, dir_count=0)
+
+        assert result.status == scan_status_class.CLEAN
+        assert result.error_message is None
+        assert result.nonfatal_warnings == [
+            "LibClamAV Warning: Cannot dlopen libclamunrar_iface: file not found, "
+            "unrar support unavailable"
+        ]
+        assert result.has_warnings is True
+
+    def test_parse_results_exit_0_with_per_file_error_reply_is_error(
+        self, daemon_scanner_class, scan_status_class
+    ):
+        """Genuine per-file '... ERROR' replies still override exit 0."""
+        scanner = daemon_scanner_class()
+
+        stdout = "/home/user/locked.bin: Can't open file or directory ERROR\n"
+
+        result = scanner._parse_results("/home/user", stdout, "", 0, file_count=1, dir_count=0)
+
+        assert result.status == scan_status_class.ERROR
+        assert result.error_message is not None
+
+    def test_parse_results_total_errors_summary_downgrades_to_clean(
+        self, daemon_scanner_class, scan_status_class
+    ):
+        """With -i suppressing per-file lines, 'Total errors: N' downgrades exit 2."""
+        scanner = daemon_scanner_class()
+
+        stdout = """
+----------- SCAN SUMMARY -----------
+Infected files: 0
+Total errors: 2
+Time: 1.000 sec (0 m 1 s)
+"""
+        result = scanner._parse_results("/home/user", stdout, "", 2, file_count=10, dir_count=1)
+
+        assert result.status == scan_status_class.CLEAN
+        assert result.warning_message == "2 file(s) could not be read"
+        assert result.error_message is None
+
+    def test_parse_results_infected_with_nonfatal_warnings_never_masked(
+        self, daemon_scanner_class, scan_status_class
+    ):
+        """Exit 2 with a FOUND line plus benign warnings must stay INFECTED."""
+        scanner = daemon_scanner_class()
+
+        stdout = """
+/home/user/eicar.txt: Eicar-Test-Signature FOUND
+"""
+        stderr = "LibClamAV Warning: cli_tnef: file truncated, returning CLEAN\n"
+
+        result = scanner._parse_results("/home/user", stdout, stderr, 2, file_count=2, dir_count=0)
+
+        assert result.status == scan_status_class.INFECTED
+        assert result.infected_count == 1
+        assert result.nonfatal_warnings == [
+            "LibClamAV Warning: cli_tnef: file truncated, returning CLEAN"
+        ]
 
 
 class TestDaemonScannerProgressParsing:
@@ -389,6 +588,46 @@ class TestDaemonScannerProgressParsing:
         assert infected_count == 1
         assert infected_files == ["/home/user/malware.exe"]
         assert len(progress_events) == 1
+
+    def test_scan_with_progress_emits_independent_snapshots(self, daemon_scanner_class):
+        """Each progress snapshot must keep len(infected_files) == infected_count.
+
+        ScanProgress objects are handed to progress_callback, which schedules a
+        GTK update via GLib.idle_add on the main thread. If the daemon scanner
+        passed the live infected_files list / infected_threats dict by reference,
+        the background thread would keep mutating them after the snapshot was
+        emitted, so an early snapshot's int infected_count would desync from the
+        ever-growing shared list (and the main thread could observe a partially
+        mutated structure). Snapshots must be independent copies.
+        """
+        scanner = daemon_scanner_class()
+        captured = []
+        lines = [
+            "/home/user/a.exe: Win.Trojan.A FOUND",
+            "/home/user/b.exe: Win.Trojan.B FOUND",
+            "/home/user/c.exe: Win.Trojan.C FOUND",
+        ]
+
+        def fake_stream(process, is_cancelled, on_line):
+            for line in lines:
+                on_line(line)
+            return ("\n".join(lines), "", False)
+
+        with patch("src.core.daemon_scanner.stream_process_output", side_effect=fake_stream):
+            scanner._scan_with_progress(
+                process=MagicMock(),
+                progress_callback=captured.append,
+                files_total=3,
+            )
+
+        assert len(captured) == 3
+        # First snapshot must reflect exactly one infection, not the final three.
+        assert captured[0].infected_files == ["/home/user/a.exe"]
+        assert len(captured[0].infected_threats) == 1
+        # Every snapshot stays internally consistent with its own count.
+        for progress in captured:
+            assert len(progress.infected_files) == progress.infected_count
+            assert len(progress.infected_threats) == progress.infected_count
 
 
 class TestDaemonScannerThreatClassification:
@@ -1072,6 +1311,74 @@ class TestDaemonScannerCountTargets:
         assert len(filtered.threat_details) == 1
         assert filtered.threat_details[0].file_path == str(threat3)
 
+    def test_filter_preserves_skipped_files(self, daemon_scanner_class, scan_status_class):
+        """skipped_files/skipped_count must survive _filter_excluded_threats rebuilds."""
+        mock_settings = MagicMock()
+        mock_settings.get.return_value = [
+            {"pattern": "/home/user/eicar.txt", "type": "file", "enabled": True},
+        ]
+        scanner = daemon_scanner_class(settings_manager=mock_settings)
+
+        from src.core.scanner import ScanResult, ThreatDetail
+
+        threat = ThreatDetail(
+            file_path="/home/user/eicar.txt",
+            threat_name="Eicar-Test-Signature",
+            category="Test",
+            severity="low",
+        )
+        kept = ThreatDetail(
+            file_path="/home/user/virus.exe",
+            threat_name="Win.Trojan.Test",
+            category="Trojan",
+            severity="high",
+        )
+
+        skipped = ["/home/user/locked.bin", "/home/user/special.sock"]
+        result = ScanResult(
+            status=scan_status_class.INFECTED,
+            path="/home/user",
+            stdout="",
+            stderr="",
+            exit_code=1,
+            infected_files=["/home/user/eicar.txt", "/home/user/virus.exe"],
+            scanned_files=4,
+            scanned_dirs=0,
+            infected_count=2,
+            error_message=None,
+            threat_details=[threat, kept],
+            skipped_files=skipped,
+            skipped_count=len(skipped),
+        )
+
+        # Excluded threat removed -> still INFECTED (kept threat survives).
+        filtered = scanner._filter_excluded_threats(result)
+        assert filtered.status == scan_status_class.INFECTED
+        assert filtered.skipped_files == skipped
+        assert filtered.skipped_count == 2
+
+        # All threats excluded -> CLEAN rebuild still carries skipped info.
+        mock_settings.get.return_value = [
+            {"pattern": "/home/user/eicar.txt", "type": "file", "enabled": True},
+            {"pattern": "/home/user/virus.exe", "type": "file", "enabled": True},
+        ]
+        cleaned = scanner._filter_excluded_threats(result)
+        assert cleaned.status == scan_status_class.CLEAN
+        assert cleaned.skipped_files == skipped
+        assert cleaned.skipped_count == 2
+
+    def test_is_excluded_respects_path_separator_boundary(self, daemon_scanner_class):
+        """Sibling paths sharing a prefix must not be excluded (no under-scan)."""
+        scanner = daemon_scanner_class()
+        patterns = ["/data/safe"]
+
+        # Exact match and true subpaths are excluded.
+        assert scanner._is_excluded("/data/safe", "safe", patterns, True) is True
+        assert scanner._is_excluded("/data/safe/x", "x", patterns, False) is True
+
+        # Prefix-sibling must NOT be excluded.
+        assert scanner._is_excluded("/data/safe-malware", "safe-malware", patterns, False) is False
+
 
 class TestDaemonScannerProcessLockThreadSafety:
     """Tests for DaemonScanner process lock and thread safety."""
@@ -1563,6 +1870,33 @@ class TestDaemonScannerExclusionHelpers:
 
 class TestDaemonScannerFlatpakSupport:
     """Tests for DaemonScanner Flatpak mode support."""
+
+    def test_file_list_temp_dir_uses_host_visible_cache_in_flatpak(
+        self, tmp_path, daemon_scanner_class
+    ):
+        """Flatpak daemon file lists must not be created in XDG_RUNTIME_DIR."""
+        scanner = daemon_scanner_class()
+
+        with (
+            patch("src.core.daemon_scanner.is_flatpak", return_value=True),
+            patch("src.core.daemon_scanner.Path.home", return_value=tmp_path),
+        ):
+            temp_dir = scanner._get_file_list_temp_dir()
+
+        expected = tmp_path / ".cache" / "clamui"
+        assert temp_dir == str(expected)
+        assert expected.is_dir()
+        assert stat.S_IMODE(expected.stat().st_mode) == 0o700
+
+    def test_file_list_temp_dir_prefers_runtime_dir_natively(
+        self, tmp_path, monkeypatch, daemon_scanner_class
+    ):
+        """Native daemon file lists can stay in the private runtime directory."""
+        scanner = daemon_scanner_class()
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+
+        with patch("src.core.daemon_scanner.is_flatpak", return_value=False):
+            assert scanner._get_file_list_temp_dir() == str(tmp_path)
 
     def test_build_command_uses_optimal_flags_in_flatpak(self, tmp_path, daemon_scanner_class):
         """Test _build_command uses --multiscan --fdpass in Flatpak mode."""

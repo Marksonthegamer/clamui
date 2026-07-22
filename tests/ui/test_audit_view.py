@@ -1134,6 +1134,23 @@ class TestEdgeCases:
         assert mock_popen.call_args[0][0] == ["gufw"]
         _clear_src_modules()
 
+    @patch("subprocess.Popen")
+    def test_on_launch_clicked_passes_clean_env(self, mock_popen, mock_gi_modules):
+        """Issue #155 residual: gufw/firewall-config are host Python/GTK
+        scripts. With stderr=DEVNULL a leaked AppImage PYTHONHOME kills them
+        instantly and silently, so Popen must get the sanitized environment."""
+        AuditView, *_ = _import_all(mock_gi_modules)
+        view = _create_view(AuditView)
+        clean_env = {"PATH": "/usr/bin:/bin", "HOME": "/home/user"}
+
+        with patch("src.core.flatpak.get_clean_env", return_value=clean_env) as mock_clean:
+            view._on_launch_clicked(MagicMock(), "gufw")
+
+        mock_clean.assert_called_once()
+        assert mock_popen.call_args[0][0] == ["gufw"]
+        assert mock_popen.call_args.kwargs["env"] is clean_env
+        _clear_src_modules()
+
     @patch("subprocess.Popen", side_effect=FileNotFoundError)
     def test_on_launch_clicked_handles_missing_binary(self, mock_popen, mock_gi_modules):
         AuditView, *_ = _import_all(mock_gi_modules)

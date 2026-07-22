@@ -19,18 +19,19 @@ This guide covers common issues and solutions for ClamUI.
 
 **Symptom:** Scans fail or ClamAV commands don't work in the Flatpak version.
 
-**Note:** The ClamUI Flatpak bundles ClamAV internally - you do NOT need to install ClamAV on your host system when
-using the Flatpak version.
+**Note:** The ClamUI Flatpak does not bundle ClamAV. Install ClamAV on the host system; ClamUI runs host
+`clamscan`, `freshclam`, and `clamdscan` through `flatpak-spawn --host`.
 
 **Possible causes and solutions:**
 
-1. **Virus definitions not downloaded**: Run a database update from within ClamUI
-2. **Corrupted installation**: Try reinstalling the Flatpak:
+1. **Host ClamAV not installed**: Install ClamAV with your distribution package manager.
+2. **Virus definitions not downloaded**: Run a database update from within ClamUI or run `sudo freshclam` on the host.
+3. **Corrupted installation**: Try reinstalling the Flatpak:
    ```bash
    flatpak uninstall io.github.linx_systems.ClamUI
    flatpak install flathub io.github.linx_systems.ClamUI
    ```
-3. **Check for errors**: Look at the ClamUI logs in `~/.var/app/io.github.linx_systems.ClamUI/data/clamui/logs/`
+4. **Check for errors**: Open **Preferences → Debug** and use **Export Logs**, or inspect the debug logs in `~/.var/app/io.github.linx_systems.ClamUI/data/clamui/debug/`
 
 ### Permission Denied Errors
 
@@ -54,23 +55,24 @@ flatpak override --user --filesystem=host io.github.linx_systems.ClamUI
 
 **Symptom:** Database updates fail with permission or path errors in Flatpak.
 
-**Cause:** Flatpak uses a separate database directory from the host system.
+**Cause:** Host `freshclam` needs network access and usually administrator/service permissions to update the host
+database directory.
 
 **Solution:**
 
-ClamUI automatically manages a Flatpak-specific database directory at
-`~/.var/app/io.github.linx_systems.ClamUI/data/clamav/`. If updates fail:
+ClamUI runs host `freshclam` from inside the Flatpak. If updates fail:
 
-1. Check the directory exists and is writable
+1. Check host ClamAV is installed (`clamscan --version`, `freshclam --version`)
 2. Verify internet connectivity
-3. Check `~/.var/app/io.github.linx_systems.ClamUI/config/clamui/freshclam.conf` for correct paths
+3. Check the host `freshclam.conf` path shown in Preferences
+4. Try `sudo freshclam` on the host to confirm ClamAV can update outside ClamUI
 
 ---
 
 ## ClamAV Installation Issues
 
-> **Note:** This section applies to **native installations only** (deb package, from source).
-> The Flatpak version bundles ClamAV internally and does not require host installation.
+> **Note:** This section applies to all installation methods, including Flatpak. The Flatpak version requires host
+> ClamAV.
 
 ### clamscan Not Found
 
@@ -104,16 +106,13 @@ ClamUI automatically manages a Flatpak-specific database directory at
 
 **Solution:**
 
-- **Flatpak**: Use ClamUI's built-in update feature (recommended)
-- **Native installation**: Run `sudo freshclam` or use ClamUI's built-in update
+- Use ClamUI's built-in update feature, or run `sudo freshclam` on the host.
 
-### clamd Daemon Not Running (Native Only)
+### clamd Daemon Not Running
 
 **Symptom:** Daemon scanner backend unavailable.
 
-> **Note:** The Flatpak version uses its bundled ClamAV and does not require the host clamd daemon.
-
-**Solution (for native installations):**
+**Solution:**
 
 1. Check daemon status:
 
@@ -128,12 +127,19 @@ ClamUI automatically manages a Flatpak-specific database directory at
    sudo systemctl enable clamav-daemon
    ```
 
-3. Verify socket exists:
+3. Verify the socket exists (path varies by distribution):
 
    ```bash
-   ls -la /var/run/clamav/clamd.ctl
-   # or
-   ls -la /run/clamav/clamd.sock
+   # Debian/Ubuntu
+   ls -la /var/run/clamav/clamd.ctl   # or /run/clamav/clamd.ctl
+   # Fedora/RHEL
+   ls -la /run/clamd.scan/clamd.sock
+   ```
+
+4. Confirm the daemon responds:
+
+   ```bash
+   clamdscan --ping 3
    ```
 
 ---
@@ -222,7 +228,7 @@ ClamUI automatically manages a Flatpak-specific database directory at
 
    ```bash
    which clamui
-   clamui --version
+   clamui help
    ```
 
 2. Try running manually with a test file:
@@ -337,7 +343,7 @@ ClamUI automatically manages a Flatpak-specific database directory at
    sudo chown -R clamav:clamav /var/lib/clamav
    ```
 
-2. For Flatpak, check the sandbox database directory permissions.
+2. For Flatpak, check host ClamAV database permissions and confirm `sudo freshclam` succeeds on the host.
 
 ### Network Errors During Update
 
@@ -362,9 +368,8 @@ ClamUI automatically manages a Flatpak-specific database directory at
    sudo rm /var/lib/clamav/*.cvd /var/lib/clamav/*.cld
    sudo freshclam
 
-   # Flatpak
-   rm ~/.var/app/io.github.linx_systems.ClamUI/data/clamav/*.cvd
-   # Then use ClamUI's update feature
+   # Flatpak: the database lives on the host (ClamAV is not bundled);
+   # use the same host commands above, then run an update from ClamUI.
    ```
 
 ---
@@ -380,5 +385,9 @@ If you can't resolve your issue:
     - Installation method (Flatpak, .deb, source)
     - Steps to reproduce
     - Error messages or logs
+    - Debug logs: open **Preferences → Debug**, raise the **Log Level** if
+      needed, then use **Export Logs** to save a ZIP (paths are redacted).
+      Debug logs live in `~/.local/share/clamui/debug/`
+      (`~/.var/app/io.github.linx_systems.ClamUI/data/clamui/debug/` in Flatpak).
 
 3. **Community support**: Join discussions on the GitHub repository

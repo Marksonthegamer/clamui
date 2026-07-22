@@ -4,6 +4,7 @@ Daemon scanner module for ClamUI using clamdscan for clamd communication.
 Provides faster scanning by leveraging the ClamAV daemon's in-memory database.
 """
 
+import contextlib
 import fnmatch
 import logging
 import os
@@ -16,7 +17,7 @@ from pathlib import Path
 
 from gi.repository import GLib
 
-from .flatpak import wrap_host_command
+from .flatpak import is_flatpak, wrap_host_command
 from .log_manager import LogManager
 from .sanitize import sanitize_surrogate_path
 from .scanner_base import (
@@ -25,6 +26,8 @@ from .scanner_base import (
     communicate_with_cancel_check,
     create_cancelled_result,
     create_error_result,
+    is_genuine_error_line,
+    resolve_exit2_status,
     save_scan_log,
     stream_process_output,
     terminate_process_gracefully,
@@ -214,9 +217,20 @@ class DaemonScanner:
             # clamdscan only emits per-file output with --file-list, not when
             # scanning a directory (which produces a single summary line)
             if use_file_list and file_paths:
-                fd, file_list_path = tempfile.mkstemp(prefix="clamui_filelist_", suffix=".txt")
+                fd, file_list_path = tempfile.mkstemp(
+                    prefix="clamui_filelist_",
+                    suffix=".txt",
+                    dir=self._get_file_list_temp_dir(),
+                )
                 os.fchmod(fd, 0o600)
-                with os.fdopen(fd, "w") as f:
+                try:
+                    f = os.fdopen(fd, "w")
+                except Exception:
+                    with contextlib.suppress(OSError):
+                        os.close(fd)
+                    raise
+
+                with f:
                     f.write("\n".join(sanitize_surrogate_path(p) for p in file_paths))
 
             # Build clamdscan command (use verbose mode if progress callback provided)
@@ -409,8 +423,8 @@ class DaemonScanner:
         Returns:
             List of command arguments (wrapped with flatpak-spawn if in Flatpak)
         """
-        # Use binary name only - don't use which_host_command() because it would
-        # return the bundled /app/bin/clamdscan which can't talk to the host daemon
+        # Use binary name only so Flatpak wraps it for host execution through
+        # flatpak-spawn instead of resolving a sandbox path.
         #
         # In verbose mode, prepend stdbuf -oL to force line-buffered stdout.
         # Without this, clamdscan's C runtime uses full buffering (~4KB blocks)
@@ -453,9 +467,32 @@ class DaemonScanner:
         if file_list_path is not None:
             cmd.extend(["--file-list", file_list_path])
         else:
+            # Use "--" so a path starting with "-" isn't reinterpreted as a flag.
+            cmd.append("--")
             cmd.append(path)
 
         return wrap_host_command(cmd, force_host=True)
+
+    def _get_file_list_temp_dir(self) -> str | None:
+        """
+        Return a temp directory that the clamdscan process can read.
+
+        In Flatpak, clamdscan runs on the host through flatpak-spawn. Files
+        created in the sandbox runtime directory (for example /run/user/$UID)
+        are not necessarily visible to that host process, so daemon file lists
+        must live in a host-visible app cache directory.
+        """
+        if is_flatpak():
+            cache_dir = Path.home() / ".cache" / "clamui"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            with contextlib.suppress(OSError):
+                os.chmod(cache_dir, 0o700)
+            return str(cache_dir)
+
+        runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+        if runtime_dir and os.path.isdir(runtime_dir):
+            return runtime_dir
+        return None
 
     def _scan_with_progress(
         self,
@@ -515,8 +552,8 @@ class DaemonScanner:
                     files_scanned=files_scanned,
                     files_total=files_total,
                     infected_count=infected_count,
-                    infected_files=infected_files,
-                    infected_threats=infected_threats,
+                    infected_files=list(infected_files),
+                    infected_threats=dict(infected_threats),
                 )
                 progress_callback(progress)
 
@@ -549,8 +586,8 @@ class DaemonScanner:
                         files_scanned=files_scanned,
                         files_total=files_total,
                         infected_count=infected_count,
-                        infected_files=infected_files,
-                        infected_threats=infected_threats,
+                        infected_files=list(infected_files),
+                        infected_threats=dict(infected_threats),
                     )
                     progress_callback(progress)
 
@@ -574,8 +611,8 @@ class DaemonScanner:
                             files_scanned=files_scanned,
                             files_total=files_total,
                             infected_count=infected_count,
-                            infected_files=infected_files,
-                            infected_threats=infected_threats,
+                            infected_files=list(infected_files),
+                            infected_threats=dict(infected_threats),
                         )
                         progress_callback(progress)
                         break
@@ -731,7 +768,8 @@ class DaemonScanner:
             # Check if pattern is an absolute path
             if pattern.startswith("/") or pattern.startswith("~"):
                 expanded = str(Path(pattern).expanduser()) if pattern.startswith("~") else pattern
-                if full_path.startswith(expanded):
+                norm = expanded.rstrip("/")
+                if full_path == norm or full_path.startswith(norm + os.sep):
                     return True
             # Check glob pattern against filename
             elif fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(full_path, pattern):
@@ -769,7 +807,7 @@ class DaemonScanner:
         """
         infected_files = []
         threat_details = []
-        skipped_files, hard_error_lines = collect_clamav_warnings(stdout, stderr)
+        skipped_files, nonfatal_warnings, hard_error_lines = collect_clamav_warnings(stdout, stderr)
         scanned_files = file_count
         scanned_dirs = dir_count
         infected_count = 0
@@ -804,25 +842,42 @@ class DaemonScanner:
 
         # Determine overall status based on exit code
         warning_message = None
-        if exit_code == 0:
-            status = ScanStatus.CLEAN
+        exit2_error_message = None
+        if infected_count > 0:
+            # Detections are authoritative: clamdscan returns exit code 2 when it
+            # both finds a virus and hits an error (e.g. an unreadable file), so
+            # never let an error code mask a real threat.
+            status = ScanStatus.INFECTED
+            if exit_code == 2 and skipped_files:
+                warning_message = f"{len(skipped_files)} file(s) could not be accessed"
+        elif exit_code == 0:
+            # Exit 0 is the daemon's authoritative success signal. Only genuine
+            # error replies (per-file "... ERROR" or clamdscan's own "ERROR:" /
+            # "LibClamAV Error:" lines) may override it — stray unrecognized
+            # warning lines must not flip a successful scan to ERROR.
+            genuine_error_lines = [line for line in hard_error_lines if is_genuine_error_line(line)]
+            status = ScanStatus.ERROR if genuine_error_lines else ScanStatus.CLEAN
         elif exit_code == 1:
             status = ScanStatus.INFECTED
         elif exit_code == 2:
-            # Exit code 2 = warnings/errors
-            # If no infections and all issues are skipped-file warnings, treat as CLEAN
-            if infected_count == 0 and len(skipped_files) > 0 and not hard_error_lines:
-                status = ScanStatus.CLEAN
-                warning_message = f"{len(skipped_files)} file(s) could not be accessed"
-            else:
-                status = ScanStatus.ERROR
+            # scanned_files here is ClamUI's own pre-count of scan targets
+            # (clamdscan reports no summary counts), so the helper compares
+            # failure signals against it instead of requiring it to be > 0.
+            status, warning_message, exit2_error_message = resolve_exit2_status(
+                stdout,
+                file_count,
+                hard_error_lines,
+                skipped_files,
+                nonfatal_warnings,
+                scanned_is_precount=True,
+            )
         else:
             status = ScanStatus.ERROR
 
         # Prefer stderr for hard errors, but fall back to a concise stdout line when stderr is empty.
         error_message: str | None = None
         if status == ScanStatus.ERROR:
-            error_message = stderr.strip() or None
+            error_message = exit2_error_message or stderr.strip() or None
             if error_message is None:
                 if hard_error_lines:
                     error_message = hard_error_lines[0]
@@ -848,6 +903,7 @@ class DaemonScanner:
             skipped_files=skipped_files,
             skipped_count=len(skipped_files),
             warning_message=warning_message,
+            nonfatal_warnings=nonfatal_warnings,
         )
 
     def _collect_exclusion_patterns(self, profile_exclusions: dict | None = None) -> list[str]:
@@ -1003,6 +1059,10 @@ class DaemonScanner:
                 infected_count=0,
                 error_message=None,
                 threat_details=[],
+                skipped_files=result.skipped_files,
+                skipped_count=result.skipped_count,
+                warning_message=result.warning_message,
+                nonfatal_warnings=result.nonfatal_warnings,
             )
 
         return ScanResult(
@@ -1017,6 +1077,10 @@ class DaemonScanner:
             infected_count=len(filtered_threats),
             error_message=None,
             threat_details=filtered_threats,
+            skipped_files=result.skipped_files,
+            skipped_count=result.skipped_count,
+            warning_message=result.warning_message,
+            nonfatal_warnings=result.nonfatal_warnings,
         )
 
     def _save_scan_log(self, result: ScanResult, duration: float) -> None:

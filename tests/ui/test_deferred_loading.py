@@ -14,8 +14,6 @@ redundant instance creation.
 import sys
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 
 def _clear_src_modules():
     """Clear all cached src.* modules to prevent test pollution."""
@@ -351,10 +349,9 @@ class TestSharedLogManager:
 
     def test_scan_view_passes_lm_to_scanner(self, mock_gi_modules):
         """ScanView should pass log_manager to Scanner constructor."""
-        from src.ui.scan_view import ScanView
-
-        # Verify ScanView __init__ signature accepts log_manager
         import inspect
+
+        from src.ui.scan_view import ScanView
 
         sig = inspect.signature(ScanView.__init__)
         assert "log_manager" in sig.parameters

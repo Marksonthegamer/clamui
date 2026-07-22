@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://clamui.com/sitemap-index.xml

@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -22,7 +22,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@v8.0.0
 
       - name: Install system dependencies
         run: |
@@ -37,9 +37,14 @@ jobs:
             pkg-config \
             python3-dev
 
-      - name: Export locked dependencies for audit
+      - name: Ensure uv.lock exists
+        run: uv lock
+
+      - name: Export dependencies for audit
+        # Must be a block scalar: a plain scalar folds the newlines and turns
+        # the backslash continuations into literal arguments, breaking uv.
         run: |
-          uv export --frozen --all-groups --format requirements.txt \
+          uv export --all-groups --format requirements.txt \
             --no-hashes --no-emit-local \
             -o requirements-audit.txt
 

@@ -10,6 +10,7 @@ and file location displays.
 import logging
 import os
 import subprocess
+import threading
 
 import gi
 
@@ -20,6 +21,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, GLib, Gtk
 
 from ...core.i18n import _
+from ...core.path_validation import validate_path
 from ..compat import (
     create_entry_row,
     create_toolbar_view,
@@ -503,9 +505,18 @@ class PreferencesPageMixin:
         - changes-allow-symbolic: Alternative shield/lock icon
 
         Returns:
-            A Gtk.Box containing the lock icon with tooltip
+            A Gtk.Box containing the lock icon with tooltip.  When the app is
+            already running as root the box is returned empty: no elevation is
+            required, so flagging the group as admin-only would be misleading.
         """
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+
+        # Running as root: every config path is directly writable and the save
+        # flow skips pkexec entirely, so omit the lock affordance.
+        from ...core.privileged_paths import is_running_as_root
+
+        if is_running_as_root():
+            return box
 
         # Create lock icon - using system-lock-screen-symbolic
         # Alternative: changes-allow-symbolic for a shield-style icon
@@ -527,33 +538,26 @@ class PreferencesPageMixin:
         Args:
             folder_path: The folder path to open
         """
-        from ...core.flatpak import is_flatpak
+        is_valid, error = validate_path(folder_path)
+        if not is_valid:
+            self._show_simple_dialog(
+                _("Invalid Path"),
+                error or _("The path is not valid."),
+            )
+            return
+
+        from ...core.flatpak import get_clean_env, is_flatpak
 
         if is_flatpak():
-            try:
-                # Check if directory exists on the host (test -d for directories)
-                check = subprocess.run(
-                    ["flatpak-spawn", "--host", "test", "-d", folder_path],
-                    capture_output=True,
-                    timeout=5,
-                )
-                if check.returncode != 0:
-                    self._show_simple_dialog(
-                        _("Folder Not Found"),
-                        _("The folder '{path}' does not exist.").format(path=folder_path),
-                    )
-                    return
-                # Open on the host filesystem
-                subprocess.Popen(
-                    ["flatpak-spawn", "--host", "xdg-open", folder_path],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            except Exception as e:
-                self._show_simple_dialog(
-                    _("Error Opening Folder"),
-                    _("Could not open folder: {error}").format(error=str(e)),
-                )
+            # The flatpak-spawn 'test -d' existence check must not block the
+            # GTK main loop; run it on a background thread and continue
+            # (xdg-open Popen + any dialogs) on the main thread via idle_add.
+            thread = threading.Thread(
+                target=self._flatpak_check_folder_exists,
+                args=(folder_path,),
+                daemon=True,
+            )
+            thread.start()
         else:
             if not os.path.isdir(folder_path):
                 self._show_simple_dialog(
@@ -566,12 +570,68 @@ class PreferencesPageMixin:
                     ["xdg-open", folder_path],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                    env=get_clean_env(),
                 )
             except Exception as e:
                 self._show_simple_dialog(
                     _("Error Opening Folder"),
                     _("Could not open folder: {error}").format(error=str(e)),
                 )
+
+    def _flatpak_check_folder_exists(self, folder_path: str):
+        """Check folder existence on the host off-thread (Flatpak only).
+
+        Runs the flatpak-spawn 'test -d' check on a background thread so it
+        does not block the GTK main loop, then schedules the continuation
+        (xdg-open Popen and any error dialogs) on the main thread.
+        """
+        error: str | None = None
+        exists = False
+        try:
+            check = subprocess.run(
+                ["flatpak-spawn", "--host", "test", "-d", folder_path],
+                capture_output=True,
+                timeout=5,
+            )
+            exists = check.returncode == 0
+        except Exception as e:
+            error = str(e)
+        GLib.idle_add(self._finish_flatpak_open_folder, folder_path, exists, error)
+
+    def _finish_flatpak_open_folder(
+        self, folder_path: str, exists: bool, error: str | None
+    ) -> bool:
+        """Continue the Flatpak folder-open action on the main thread.
+
+        Returns:
+            False to remove from GLib.idle_add
+        """
+        if error is not None:
+            self._show_simple_dialog(
+                _("Error Opening Folder"),
+                _("Could not open folder: {error}").format(error=error),
+            )
+            return False
+        if not exists:
+            self._show_simple_dialog(
+                _("Folder Not Found"),
+                _("The folder '{path}' does not exist.").format(path=folder_path),
+            )
+            return False
+        try:
+            subprocess.Popen(
+                ["flatpak-spawn", "--host", "xdg-open", folder_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception as e:
+            self._show_simple_dialog(
+                _("Error Opening Folder"),
+                _("Could not open folder: {error}").format(error=str(e)),
+            )
+        return False
 
     def _show_simple_dialog(self, title: str, message: str):
         """

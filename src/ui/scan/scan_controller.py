@@ -9,6 +9,7 @@ Single responsibility:
 - Result compilation
 """
 
+import logging
 import threading
 import time
 from collections.abc import Callable
@@ -17,8 +18,11 @@ from enum import Enum
 
 from gi.repository import GLib
 
+from ...core.result_formatters import compose_scan_warning
 from ...core.scanner import Scanner, ScanProgress, ScanResult, ScanStatus
 from ...core.settings_manager import SettingsManager
+
+logger = logging.getLogger(__name__)
 
 
 class ScanState(Enum):
@@ -38,10 +42,15 @@ class AggregatedResult:
     infected_files: list[str] = field(default_factory=list)
     threat_details: list = field(default_factory=list)
     error_messages: list[str] = field(default_factory=list)
+    skipped_files: list[str] = field(default_factory=list)
+    skipped_count: int = 0
+    nonfatal_warnings: list[str] = field(default_factory=list)
+    warning_messages: list[str] = field(default_factory=list)
 
     def to_scan_result(self, paths: list[str]) -> ScanResult:
         """Convert to ScanResult for dialog compatibility."""
         exit_code = 1 if self.status == ScanStatus.INFECTED else (2 if self.error_messages else 0)
+        warning_message = compose_scan_warning(self.skipped_count, self.warning_messages)
         return ScanResult(
             status=self.status,
             path=", ".join(paths) if len(paths) > 1 else paths[0] if paths else "",
@@ -54,6 +63,10 @@ class AggregatedResult:
             infected_count=self.total_infected,
             error_message="; ".join(self.error_messages) if self.error_messages else None,
             threat_details=self.threat_details,
+            skipped_files=self.skipped_files,
+            skipped_count=self.skipped_count,
+            warning_message=warning_message,
+            nonfatal_warnings=self.nonfatal_warnings,
         )
 
 
@@ -131,6 +144,12 @@ class ScanController:
         if not paths:
             return
 
+        # Ignore re-entrant starts: a scan already running would otherwise spawn
+        # a second worker thread sharing this controller's Scanner, racing on
+        # cancellation state and delivering duplicate completion callbacks.
+        if self._state == ScanState.SCANNING:
+            return
+
         self._state = ScanState.SCANNING
         self._cancel_all = False
         self._cumulative_files = 0
@@ -155,61 +174,81 @@ class ScanController:
     def _scan_worker(self, paths: list[str], profile_exclusions: dict | None):
         """Background worker for multi-target scanning."""
         result = AggregatedResult()
-        total_targets = len(paths)
+        try:
+            total_targets = len(paths)
 
-        show_live = True
-        if self._settings:
-            show_live = self._settings.get("show_live_progress", True)
+            show_live = True
+            if self._settings:
+                show_live = self._settings.get("show_live_progress", True)
 
-        progress_callback = self._create_progress_callback() if show_live else None
+            progress_callback = self._create_progress_callback() if show_live else None
 
-        for idx, path in enumerate(paths, start=1):
-            if self._cancel_all:
-                result.status = ScanStatus.CANCELLED
-                break
+            for idx, path in enumerate(paths, start=1):
+                if self._cancel_all:
+                    result.status = ScanStatus.CANCELLED
+                    break
 
-            self._current_target_idx = idx
+                self._current_target_idx = idx
 
-            if self._on_target_progress:
-                GLib.idle_add(self._on_target_progress, idx, total_targets, path)
+                if self._on_target_progress:
+                    GLib.idle_add(self._on_target_progress, idx, total_targets, path)
 
-            scan_result = self._scanner.scan_sync(
-                path,
-                recursive=True,
-                profile_exclusions=profile_exclusions,
-                progress_callback=progress_callback,
-            )
+                scan_result = self._scanner.scan_sync(
+                    path,
+                    recursive=True,
+                    profile_exclusions=profile_exclusions,
+                    progress_callback=progress_callback,
+                )
 
-            if scan_result.status == ScanStatus.CANCELLED or self._cancel_all:
-                self._aggregate_partial(result, scan_result)
-                result.status = ScanStatus.CANCELLED
-                break
+                if scan_result.status == ScanStatus.CANCELLED or self._cancel_all:
+                    self._aggregate_partial(result, scan_result)
+                    result.status = ScanStatus.CANCELLED
+                    break
 
-            self._cumulative_files += scan_result.scanned_files
-            self._aggregate_result(result, scan_result)
+                self._cumulative_files += scan_result.scanned_files
+                self._aggregate_result(result, scan_result)
 
-        if result.status != ScanStatus.CANCELLED:
-            if result.total_infected > 0:
-                result.status = ScanStatus.INFECTED
-            elif result.error_messages:
-                result.status = ScanStatus.ERROR
-            else:
-                result.status = ScanStatus.CLEAN
+            if result.status != ScanStatus.CANCELLED:
+                if result.total_infected > 0:
+                    result.status = ScanStatus.INFECTED
+                elif result.error_messages:
+                    result.status = ScanStatus.ERROR
+                else:
+                    result.status = ScanStatus.CLEAN
+        except Exception as exc:
+            # A crash in the scan worker thread must never leave the UI stuck
+            # in the SCANNING state (spinner spinning, buttons disabled). Record
+            # the failure as an error result and fall through to finalization so
+            # on_state_change(IDLE) and on_complete still fire on the main loop.
+            logger.exception("Scan worker thread crashed")
+            result.status = ScanStatus.ERROR
+            if not result.error_messages:
+                result.error_messages.append(str(exc))
+        finally:
+            final_result = result.to_scan_result(paths)
 
-        self._state = ScanState.IDLE
-        if self._on_state_change:
-            GLib.idle_add(self._on_state_change, self._state)
+            def _finalize():
+                # Runs on the main thread: flipping to IDLE here (rather than
+                # on the worker thread) keeps is_scanning True until callers
+                # of start_scan — which is main-thread-only — can no longer
+                # race a second worker against this one. Completion is
+                # delivered BEFORE the state change: state-change consumers
+                # (tray status, coordinator) read the current result, and
+                # firing IDLE first would hand them the previous scan's
+                # result (or None) — e.g. a "protected" tray icon right
+                # after threats were found.
+                self._state = ScanState.IDLE
+                if self._on_complete:
+                    self._on_complete(final_result)
+                if self._on_state_change:
+                    self._on_state_change(self._state)
+                return False
 
-        if self._on_complete:
-            GLib.idle_add(self._on_complete, result.to_scan_result(paths))
+            GLib.idle_add(_finalize)
 
     def _aggregate_result(self, agg: AggregatedResult, scan: ScanResult):
         """Add scan result to aggregated total."""
-        agg.total_files += scan.scanned_files
-        agg.total_dirs += scan.scanned_dirs
-        agg.total_infected += scan.infected_count
-        agg.infected_files.extend(scan.infected_files)
-        agg.threat_details.extend(scan.threat_details)
+        self._aggregate_partial(agg, scan)
 
         if scan.status == ScanStatus.ERROR and scan.error_message:
             agg.error_messages.append(scan.error_message)
@@ -223,6 +262,21 @@ class ScanController:
         agg.total_infected += scan.infected_count
         agg.infected_files.extend(scan.infected_files)
         agg.threat_details.extend(scan.threat_details)
+        seen_skipped = set(agg.skipped_files)
+        for skipped in scan.skipped_files or []:
+            if skipped not in seen_skipped:
+                seen_skipped.add(skipped)
+                agg.skipped_files.append(skipped)
+        # Keep the count in sync with the deduplicated list so overlapping
+        # targets never over-report skipped files.
+        agg.skipped_count = len(agg.skipped_files)
+        seen_warnings = set(agg.nonfatal_warnings)
+        for warning in scan.nonfatal_warnings or []:
+            if warning not in seen_warnings:
+                seen_warnings.add(warning)
+                agg.nonfatal_warnings.append(warning)
+        if scan.warning_message and scan.warning_message not in agg.warning_messages:
+            agg.warning_messages.append(scan.warning_message)
 
     def _create_progress_callback(self):
         """Create throttled progress callback."""

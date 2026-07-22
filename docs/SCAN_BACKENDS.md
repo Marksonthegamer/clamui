@@ -33,7 +33,7 @@ Uses the clamd background service exclusively. Database stays in memory for inst
 
 ## Clamscan Backend
 
-Uses the standalone `clamscan` command. Loads the database from disk for each scan (3-10 sec overhead). No background service needed.
+Uses the standalone `clamscan` command. Loads the database from disk for each scan (3-10 sec overhead). No background service needed. ClamUI forwards the relevant `clamd.conf` limits (`MaxFileSize`, `MaxScanSize`, `MaxRecursion`, `MaxFiles`) as `--max-filesize`/`--max-scansize`/`--max-recursion`/`--max-files` so scan limits stay consistent with the daemon backend.
 
 **Best for:** Occasional scans, minimal installations, troubleshooting.
 
@@ -70,7 +70,7 @@ sudo systemctl start clamav-daemon
 
 ### Flatpak Users
 
-The ClamUI Flatpak bundles ClamAV (clamscan, freshclam) internally. To use the daemon backend, clamd must be installed on the **host system** since it runs as a system service outside the sandbox. ClamUI auto-detects the host daemon.
+The ClamUI Flatpak does not bundle ClamAV. Install `clamscan` and `freshclam` on the **host system**; ClamUI runs them through `flatpak-spawn --host`. To use the daemon backend, install and start host `clamd`/`clamdscan`. ClamUI auto-detects the host daemon.
 
 ## Exit Codes
 

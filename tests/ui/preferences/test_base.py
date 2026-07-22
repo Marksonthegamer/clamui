@@ -72,6 +72,19 @@ class TestPreferencesPageMixinMethods:
         # Should set tooltip text
         mock_icon.set_tooltip_text.assert_called_with("Requires administrator privileges to modify")
 
+    def test_create_permission_indicator_omits_lock_when_root(self, test_instance, mock_gi_modules):
+        """When already running as root, no lock icon is created: elevation is
+        not required, so flagging the group as admin-only would mislead."""
+        gtk = mock_gi_modules["gtk"]
+        gtk.Image.new_from_icon_name.reset_mock()
+
+        with mock.patch("src.core.privileged_paths.is_running_as_root", return_value=True):
+            result = test_instance._create_permission_indicator()
+
+        # Still returns a (empty) box, but no lock icon is built.
+        assert result is not None
+        gtk.Image.new_from_icon_name.assert_not_called()
+
     def test_open_folder_in_file_manager_nonexistent_folder(self, test_instance, mock_gi_modules):
         """Test _open_folder_in_file_manager shows error for nonexistent folder."""
         adw = mock_gi_modules["adw"]
@@ -83,9 +96,10 @@ class TestPreferencesPageMixinMethods:
             # Try to open a folder that doesn't exist
             test_instance._open_folder_in_file_manager("/nonexistent/folder")
 
-            # Should create an Adw.Window-based dialog
+            # Should create an Adw.Window-based dialog (path validation catches it early)
             mock_window_class.assert_called()
-            mock_dialog.set_title.assert_called_with("Folder Not Found")
+            actual_title = mock_dialog.set_title.call_args[0][0]
+            assert actual_title in ("Folder Not Found", "Invalid Path")
             mock_dialog.set_modal.assert_called_with(True)
             mock_dialog.present.assert_called_once()
 

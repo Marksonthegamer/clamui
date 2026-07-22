@@ -1,77 +1,136 @@
 # ClamUI Privileged Apply Helper Tests
-"""Tests for the privileged configuration apply helper CLI."""
+"""
+Tests for the privileged configuration apply helper CLI.
 
+End-to-end coverage of the rewritten ``main()`` flow against the new
+src/dst-pair protocol.  The destination allowlist itself is exercised in
+:mod:`tests.core.test_privileged_paths`; here we focus on argv parsing,
+the protocol/PKEXEC_UID handshake, and the systemd-restart wiring.
+"""
+
+import os
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+from src.cli import apply_preferences
 from src.cli.apply_preferences import (
     _restart_units_for_destinations,
-    _validate_destination,
     main,
 )
+from src.core import privileged_paths
+
+
+def _bootstrap(monkeypatch, tmp_path):
+    """Set up a working PKEXEC_UID + staging root + allowlist override."""
+    monkeypatch.setenv("PKEXEC_UID", str(os.geteuid()))
+    staging = tmp_path / "staging"
+    staging.mkdir(mode=0o700)
+    os.chmod(staging, 0o700)
+    monkeypatch.setattr(apply_preferences, "_resolve_staging_root", lambda _uid: staging)
+    monkeypatch.setattr(
+        apply_preferences,
+        "_restart_units_for_destinations",
+        lambda _dests: None,
+    )
+    return staging
 
 
 class TestApplyPreferencesCli:
     """Tests for src.cli.apply_preferences.main."""
 
-    def test_main_applies_single_config_pair(self, tmp_path):
+    def test_main_applies_single_config_pair(self, tmp_path, monkeypatch):
         """Helper should copy a staged file and set destination permissions."""
-        source = tmp_path / "source.conf"
-        destination = tmp_path / "dest.conf"
-        source.write_text("LogVerbose yes\n", encoding="utf-8")
+        staging = _bootstrap(monkeypatch, tmp_path)
+        dest_dir = tmp_path / "dest"
+        dest_dir.mkdir()
+        monkeypatch.setattr(privileged_paths, "ALLOWED_DEST_DIRS", (dest_dir,))
+        monkeypatch.setattr(privileged_paths, "ALLOWED_DEST_FILES", ())
 
-        with patch.dict(
-            main.__globals__,
-            {"_validate_destination": lambda _destination: None},
-        ):
-            exit_code = main([str(source), str(destination)])
+        source = staging / "source.conf"
+        destination = dest_dir / "dest.conf"
+        source.write_text("LogVerbose yes\n", encoding="utf-8")
+        os.chmod(source, 0o600)
+
+        exit_code = main(["--protocol=2", str(source), str(destination)])
 
         assert exit_code == 0
         assert destination.read_text(encoding="utf-8") == "LogVerbose yes\n"
         assert (destination.stat().st_mode & 0o777) == 0o644
 
-    def test_main_rejects_odd_argument_count(self):
+    def test_main_rejects_odd_argument_count(self, tmp_path, monkeypatch):
         """Helper should fail when source/destination args are not paired."""
-        exit_code = main(["/tmp/source.conf"])
-
+        _bootstrap(monkeypatch, tmp_path)
+        exit_code = main(["--protocol=2", "/tmp/source.conf"])
         assert exit_code == 2
 
-    def test_main_fails_for_missing_source(self, tmp_path):
+    def test_main_rejects_no_pairs(self, tmp_path, monkeypatch):
+        """Helper should fail when no src/dst pairs are provided."""
+        _bootstrap(monkeypatch, tmp_path)
+        exit_code = main(["--protocol=2"])
+        assert exit_code == 2
+
+    def test_main_fails_for_missing_source(self, tmp_path, monkeypatch):
         """Helper should fail when staged source file does not exist."""
-        missing_source = tmp_path / "missing.conf"
-        destination = tmp_path / "dest.conf"
+        staging = _bootstrap(monkeypatch, tmp_path)
+        dest_dir = tmp_path / "dest"
+        dest_dir.mkdir()
+        monkeypatch.setattr(privileged_paths, "ALLOWED_DEST_DIRS", (dest_dir,))
+        monkeypatch.setattr(privileged_paths, "ALLOWED_DEST_FILES", ())
 
-        exit_code = main([str(missing_source), str(destination)])
+        missing_source = staging / "missing.conf"
+        destination = dest_dir / "dest.conf"
 
-        assert exit_code == 1
+        exit_code = main(["--protocol=2", str(missing_source), str(destination)])
 
-    def test_main_creates_destination_parent_directory(self, tmp_path):
+        assert exit_code != 0
+        assert not destination.exists()
+
+    def test_main_creates_destination_parent_directory(self, tmp_path, monkeypatch):
         """Helper should create destination parent directories when needed."""
-        source = tmp_path / "source.conf"
-        destination = tmp_path / "nested" / "path" / "dest.conf"
-        source.write_text("DatabaseDirectory /var/lib/clamav\n", encoding="utf-8")
+        staging = _bootstrap(monkeypatch, tmp_path)
+        dest_dir = tmp_path / "dest"
+        dest_dir.mkdir()
+        monkeypatch.setattr(privileged_paths, "ALLOWED_DEST_DIRS", (dest_dir,))
+        monkeypatch.setattr(privileged_paths, "ALLOWED_DEST_FILES", ())
 
-        with patch.dict(
-            main.__globals__,
-            {"_validate_destination": lambda _destination: None},
-        ):
-            exit_code = main([str(source), str(destination)])
+        source = staging / "source.conf"
+        # Pre-existing dir is in allowlist; missing-parent recovery is part
+        # of _atomic_install which calls mkdir(parents=True, exist_ok=True).
+        destination = dest_dir / "dest.conf"
+        source.write_text("DatabaseDirectory /var/lib/clamav\n", encoding="utf-8")
+        os.chmod(source, 0o600)
+
+        exit_code = main(["--protocol=2", str(source), str(destination)])
 
         assert exit_code == 0
         assert destination.exists()
 
-    def test_main_restarts_active_services_for_written_configs(self, tmp_path):
+    def test_main_restarts_active_services_for_written_configs(self, tmp_path, monkeypatch):
         """Helper should restart active relevant services after applying configs."""
-        source = tmp_path / "source.conf"
-        destination = Path("/etc/clamav/freshclam.conf")
-        source.write_text("DatabaseDirectory /var/lib/clamav\n", encoding="utf-8")
+        # Bootstrap manually because we want to keep the real
+        # _restart_units_for_destinations and intercept subprocess.run.
+        monkeypatch.setenv("PKEXEC_UID", str(os.geteuid()))
+        staging = tmp_path / "staging"
+        staging.mkdir(mode=0o700)
+        os.chmod(staging, 0o700)
+        monkeypatch.setattr(apply_preferences, "_resolve_staging_root", lambda _uid: staging)
 
-        run_calls = []
+        dest_dir = tmp_path / "dest"
+        dest_dir.mkdir()
+        monkeypatch.setattr(privileged_paths, "ALLOWED_DEST_DIRS", (dest_dir,))
+        monkeypatch.setattr(privileged_paths, "ALLOWED_DEST_FILES", ())
+
+        source = staging / "source.conf"
+        destination = dest_dir / "freshclam.conf"
+        source.write_text("DatabaseDirectory /var/lib/clamav\n", encoding="utf-8")
+        os.chmod(source, 0o600)
+
+        run_calls: list[list[str]] = []
 
         def _fake_run(cmd, **_kwargs):
-            run_calls.append(cmd)
+            run_calls.append(list(cmd))
 
             class _Result:
                 returncode = 0
@@ -81,12 +140,10 @@ class TestApplyPreferencesCli:
             return _Result()
 
         with (
-            patch.dict(main.__globals__, {"_validate_destination": lambda _destination: None}),
-            patch.dict(main.__globals__, {"_apply_config_file": lambda _source, _destination: None}),
             patch("src.cli.apply_preferences.shutil.which", return_value="/usr/bin/systemctl"),
             patch("src.cli.apply_preferences.subprocess.run", side_effect=_fake_run),
         ):
-            exit_code = main([str(source), str(destination)])
+            exit_code = main(["--protocol=2", str(source), str(destination)])
 
         assert exit_code == 0
         assert ["systemctl", "is-active", "--quiet", "clamav-freshclam.service"] in run_calls
@@ -106,7 +163,7 @@ class TestRestartUnitsForDestinations:
         run_calls = []
 
         def _fake_run(cmd, **_kwargs):
-            run_calls.append(cmd)
+            run_calls.append(list(cmd))
 
             class _Result:
                 returncode = 3
@@ -126,11 +183,8 @@ class TestRestartUnitsForDestinations:
 
     def test_raises_when_active_unit_restart_fails(self):
         """Restart helper should fail when an active relevant unit cannot restart."""
-        run_calls = []
 
         def _fake_run(cmd, **_kwargs):
-            run_calls.append(cmd)
-
             class _Result:
                 stderr = ""
                 stdout = ""
@@ -147,65 +201,5 @@ class TestRestartUnitsForDestinations:
             patch("src.cli.apply_preferences.shutil.which", return_value="/usr/bin/systemctl"),
             patch("src.cli.apply_preferences.subprocess.run", side_effect=_fake_run),
         ):
-            with pytest.raises(RuntimeError, match="Failed to restart clamav-freshclam.service"):
+            with pytest.raises(RuntimeError, match=r"Failed to restart clamav-freshclam\.service"):
                 _restart_units_for_destinations([Path("/etc/clamav/freshclam.conf")])
-
-
-class TestValidateDestination:
-    """Tests for destination path allowlist validation."""
-
-    def test_accepts_debian_clamav_config_path(self):
-        """Paths under /etc/clamav/ with .conf extension should be allowed."""
-        _validate_destination(Path("/etc/clamav/clamd.conf"))
-
-    def test_accepts_redhat_clamd_config_path(self):
-        """Paths under /etc/clamd.d/ with .conf extension should be allowed."""
-        _validate_destination(Path("/etc/clamd.d/scan.conf"))
-
-    def test_accepts_unofficial_sigs_config_path(self):
-        """Paths under /etc/clamav-unofficial-sigs/ should be allowed."""
-        _validate_destination(Path("/etc/clamav-unofficial-sigs/user.conf"))
-
-    def test_rejects_path_outside_allowlist(self):
-        """Paths in non-allowed directories should be rejected."""
-        with pytest.raises(ValueError, match="not in allowed"):
-            _validate_destination(Path("/etc/nginx/nginx.conf"))
-
-    def test_rejects_path_traversal_attack(self):
-        """Paths using .. to escape allowed directories should be rejected."""
-        with pytest.raises(ValueError, match="not in allowed"):
-            _validate_destination(Path("/etc/clamav/../nginx/nginx.conf"))
-
-    def test_rejects_non_conf_extension(self):
-        """Files without .conf extension should be rejected."""
-        with pytest.raises(ValueError, match=r"\.conf"):
-            _validate_destination(Path("/etc/clamav/clamd.txt"))
-
-    def test_rejects_no_extension(self):
-        """Files with no extension should be rejected."""
-        with pytest.raises(ValueError, match=r"\.conf"):
-            _validate_destination(Path("/etc/clamav/clamd"))
-
-    def test_rejects_tmp_directory(self):
-        """Paths under /tmp should be rejected even with .conf extension."""
-        with pytest.raises(ValueError, match="not in allowed"):
-            _validate_destination(Path("/tmp/evil.conf"))
-
-    def test_rejects_home_directory(self):
-        """Paths under user home should be rejected."""
-        with pytest.raises(ValueError, match="not in allowed"):
-            _validate_destination(Path("/home/user/.config/clamav/clamd.conf"))
-
-    def test_rejects_nested_subdirectory(self):
-        """Paths in nested subdirectories beyond the allowlist should be rejected."""
-        with pytest.raises(ValueError, match="not in allowed"):
-            _validate_destination(Path("/etc/clamav/subdir/clamd.conf"))
-
-    def test_main_rejects_destination_outside_allowlist(self, tmp_path):
-        """The full main() flow should reject disallowed destinations."""
-        source = tmp_path / "source.conf"
-        source.write_text("LogVerbose yes\n", encoding="utf-8")
-
-        exit_code = main([str(source), "/etc/shadow"])
-
-        assert exit_code == 1

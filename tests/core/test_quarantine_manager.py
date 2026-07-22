@@ -544,6 +544,65 @@ class TestQuarantineManagerPermissions:
         assert entry is not None
         assert entry.original_permissions == 0o700
 
+    def test_restore_strips_setuid_bits_from_destination(self, manager, temp_dir):
+        """Regression for VULN-004: a tampered DB row with setuid/setgid/sticky
+        bits MUST NOT propagate those bits onto a restored file's mode.
+
+        Skipped on filesystems that don't honor setuid bits (e.g. some tmpfs
+        configs and unprivileged sandboxes).
+        """
+        import sqlite3
+        import stat as stat_module
+
+        # Quick capability probe: write a temp file and try to chmod 0o4755.
+        probe = os.path.join(temp_dir, ".setuid_probe")
+        with open(probe, "wb") as f:
+            f.write(b"probe")
+        try:
+            os.chmod(probe, 0o4755)
+            mode = os.stat(probe).st_mode & 0o7777
+            setuid_supported = bool(mode & stat_module.S_ISUID)
+        except OSError:
+            setuid_supported = False
+        finally:
+            if os.path.exists(probe):
+                os.unlink(probe)
+        if not setuid_supported:
+            pytest.skip("filesystem does not honor setuid bits")
+
+        # Create and quarantine a normal file.
+        file_path = os.path.join(temp_dir, "files", "victim.sh")
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        with open(file_path, "wb") as f:
+            f.write(b"#!/bin/bash\necho hi")
+        os.chmod(file_path, 0o755)
+
+        qresult = manager.quarantine_file(file_path, "TestThreat")
+        assert qresult.is_success is True
+        entry_id = qresult.entry.id
+
+        # Tamper with the DB to inject high-bit permissions (setuid+setgid+755).
+        db_path = manager._database._db_path
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute("PRAGMA ignore_check_constraints = ON")
+            conn.execute(
+                "UPDATE quarantine SET original_permissions = ? WHERE id = ?",
+                (0o6755, entry_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Restore — masking must strip the high bits.
+        restore_result = manager.restore_file(entry_id)
+        assert restore_result.is_success is True
+
+        restored_mode = os.stat(file_path).st_mode & 0o7777
+        assert restored_mode == 0o755, (
+            f"Restored file mode is {oct(restored_mode)}; setuid/setgid leaked from tampered DB row"
+        )
+
 
 class TestQuarantineManagerDelete:
     """Tests for the QuarantineManager delete operations."""
@@ -1003,10 +1062,11 @@ class TestQuarantineManagerDbFailureAfterRestore:
         ):
             result = manager.restore_file(quarantined_file.id)
 
-        # Restore should still succeed
-        assert result.is_success is True
+        # Restore: file op succeeded but DB removal failed -> DATABASE_ERROR (not success)
+        assert result.status == QuarantineStatus.DATABASE_ERROR
+        assert result.is_success is False
 
-        # File should be restored
+        # File should still be restored (the file operation itself succeeded)
         assert Path(quarantined_file.original_path).exists()
 
         # Warning should be logged
@@ -1030,10 +1090,11 @@ class TestQuarantineManagerDbFailureAfterRestore:
         ):
             result = manager.delete_file(quarantined_file.id)
 
-        # Delete should still succeed
-        assert result.is_success is True
+        # Delete: file op succeeded but DB removal failed -> DATABASE_ERROR (not success)
+        assert result.status == QuarantineStatus.DATABASE_ERROR
+        assert result.is_success is False
 
-        # File should be deleted
+        # File should still be deleted (the file operation itself succeeded)
         assert not quarantine_path.exists()
 
         # Warning should be logged
@@ -1051,7 +1112,9 @@ class TestQuarantineManagerDbFailureAfterRestore:
         with patch.object(manager._database, "remove_entry", return_value=False):
             result = manager.restore_file(quarantined_file.id)
 
-        assert result.is_success is True
+        # File op succeeded but DB removal failed -> DATABASE_ERROR (not success)
+        assert result.status == QuarantineStatus.DATABASE_ERROR
+        assert result.is_success is False
 
         # Entry still exists in DB (orphaned)
         assert manager.get_entry(quarantined_file.id) is not None
@@ -1074,7 +1137,9 @@ class TestQuarantineManagerDbFailureAfterRestore:
         with patch.object(manager._database, "remove_entry", return_value=False):
             result = manager.delete_file(quarantined_file.id)
 
-        assert result.is_success is True
+        # File op succeeded but DB removal failed -> DATABASE_ERROR (not success)
+        assert result.status == QuarantineStatus.DATABASE_ERROR
+        assert result.is_success is False
 
         # Entry still exists in DB (orphaned)
         assert manager.get_entry(quarantined_file.id) is not None
@@ -1302,3 +1367,69 @@ class TestQuarantineManagerPeriodicCleanup:
         assert result2 is False  # Throttled
 
         mgr._database.close()
+
+
+class TestQuarantineManagerCleanupOldEntries:
+    """Regression: cleanup_old_entries must keep the DB row when its file cannot be
+    deleted, otherwise the file becomes an orphan that cleanup_orphaned_entries
+    (which only prunes rows whose files are MISSING) can never reclaim."""
+
+    @pytest.fixture
+    def temp_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield tmpdir
+
+    @pytest.fixture
+    def manager(self, temp_dir):
+        mgr = QuarantineManager(
+            quarantine_directory=os.path.join(temp_dir, "quarantine"),
+            database_path=os.path.join(temp_dir, "quarantine.db"),
+        )
+        yield mgr
+        mgr._database.close()
+
+    def _quarantine(self, manager, temp_dir, name):
+        path = os.path.join(temp_dir, name)
+        with open(path, "wb") as f:
+            f.write(b"data-" + name.encode())
+        result = manager.quarantine_file(path, "TestThreat")
+        assert result.is_success is True
+        return result.entry
+
+    def test_failed_file_deletion_keeps_db_row(self, manager, temp_dir):
+        from unittest.mock import patch
+
+        good = self._quarantine(manager, temp_dir, "good.exe")
+        bad = self._quarantine(manager, temp_dir, "bad.exe")
+
+        real_delete = manager._file_handler.delete_from_quarantine
+
+        def fake_delete(qpath):
+            if qpath == bad.quarantine_path:
+                raise OSError("simulated deletion failure")
+            return real_delete(qpath)
+
+        with (
+            patch.object(manager, "get_old_entries", return_value=[good, bad]),
+            patch.object(manager._file_handler, "delete_from_quarantine", side_effect=fake_delete),
+        ):
+            removed = manager.cleanup_old_entries(days=0)
+
+        # Only the entry whose file was actually removed is dropped from the DB.
+        assert removed == 1
+        assert manager.get_entry(good.id) is None
+        # The failed entry's row is retained so the file stays tracked (no orphan).
+        assert manager.get_entry(bad.id) is not None
+        assert Path(bad.quarantine_path).exists()
+
+    def test_already_missing_file_still_removes_row(self, manager, temp_dir):
+        from unittest.mock import patch
+
+        entry = self._quarantine(manager, temp_dir, "gone.exe")
+        os.remove(entry.quarantine_path)  # file vanished before cleanup ran
+
+        with patch.object(manager, "get_old_entries", return_value=[entry]):
+            removed = manager.cleanup_old_entries(days=0)
+
+        assert removed == 1
+        assert manager.get_entry(entry.id) is None

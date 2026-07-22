@@ -77,22 +77,32 @@ ClamAV 1.0.0/...
 
 #### Solution 3: Flatpak-Specific Issues
 
-If you installed ClamUI via Flatpak, ClamAV is **bundled internally** — no host installation is required.
+If you installed ClamUI via Flatpak, install ClamAV on the host system. The Flatpak runs host `clamscan`,
+`freshclam`, and `clamdscan` through `flatpak-spawn --host`.
 
 **If you still see "ClamAV Not Found" errors:**
 
-1. **Reinstall the Flatpak** (may fix corrupted installation):
+1. **Install host ClamAV**:
+   ```bash
+   sudo apt install clamav clamav-freshclam      # Ubuntu/Debian
+   sudo dnf install clamav clamav-update        # Fedora
+   sudo pacman -S clamav                        # Arch Linux
+   ```
+
+2. **Check for database update errors**:
+   - Open ClamUI and go to the "Update" view
+   - Click "Update Database" and watch for errors
+   - Or run `sudo freshclam` on the host
+   - Check logs in `~/.var/app/io.github.linx_systems.ClamUI/data/clamui/logs/`
+
+3. **Reinstall the Flatpak** (may fix corrupted installation):
    ```bash
    flatpak uninstall io.github.linx_systems.ClamUI
    flatpak install flathub io.github.linx_systems.ClamUI
    ```
 
-2. **Check for database update errors** (database may not have downloaded):
-   - Open ClamUI and go to the "Update" view
-   - Click "Update Database" and watch for errors
-   - Check logs in `~/.var/app/io.github.linx_systems.ClamUI/data/clamui/logs/`
-
-**Note:** The daemon scan backend requires clamd on the host system. If you want to use daemon scanning, install clamav-daemon on your host and set `"scan_backend": "daemon"` in settings. Otherwise, use the default `"clamscan"` backend which uses the bundled ClamAV.
+**Note:** The daemon scan backend requires host `clamd`/`clamdscan`. If you want to use daemon scanning, install
+`clamav-daemon` on your host and set `"scan_backend": "daemon"` in settings.
 
 **Check Flatpak permissions:**
 
@@ -218,8 +228,9 @@ The daemon communicates via a Unix socket. Permission issues can prevent access.
 ```bash
 # Common locations (checked in this order):
 ls -la /var/run/clamav/clamd.ctl      # Ubuntu/Debian
-ls -la /run/clamav/clamd.ctl          # Alternative
-ls -la /var/run/clamd.scan/clamd.sock # Fedora
+ls -la /run/clamav/clamd.ctl          # Alternative (Ubuntu/Debian)
+ls -la /run/clamd.scan/clamd.sock     # Fedora/RHEL
+ls -la /var/run/clamd.scan/clamd.sock # Fedora/RHEL (alternative)
 ```
 
 **Check permissions:**
@@ -268,6 +279,12 @@ Incorrect configuration can prevent the daemon from starting.
 
 ```bash
 sudo nano /etc/clamav/clamd.conf
+```
+
+On Fedora/RHEL the daemon config lives at `/etc/clamd.d/scan.conf` instead:
+
+```bash
+sudo nano /etc/clamd.d/scan.conf
 ```
 
 **Key settings to verify:**
@@ -820,7 +837,7 @@ ls -la ~/.local/share/clamui/quarantine/
 ls -la ~/.local/share/clamui/quarantine/
 
 # Check database entries
-sqlite3 ~/.local/share/clamui/quarantine.db "SELECT original_path, quarantine_path FROM quarantine_entries;"
+sqlite3 ~/.local/share/clamui/quarantine.db "SELECT original_path, quarantine_path FROM quarantine;"
 ```
 
 **Manually reconcile (advanced):**
@@ -832,7 +849,7 @@ If you see files in the directory but not in the database, or vice versa, you ma
 ls ~/.local/share/clamui/quarantine/
 
 # List entries in database
-sqlite3 ~/.local/share/clamui/quarantine.db "SELECT * FROM quarantine_entries;"
+sqlite3 ~/.local/share/clamui/quarantine.db "SELECT * FROM quarantine;"
 ```
 
 If they don't match, the safest approach is:
@@ -1026,7 +1043,7 @@ crontab -l | grep clamui
 **Expected output (example for daily at 2:00 AM):**
 
 ```
-0 2 * * * /usr/bin/clamui-scheduled-scan --targets /home/user --scheduled
+0 2 * * * /usr/bin/clamui-scheduled-scan --target /home/user
 ```
 
 **If nothing appears:**
@@ -1116,10 +1133,10 @@ journalctl --user -u clamui-scheduled-scan.service -n 50
 
 ```bash
 # Run the scheduled scan script directly
-clamui-scheduled-scan --targets ~/Downloads --scheduled
+clamui-scheduled-scan --target ~/Downloads
 
 # Or with full path:
-/usr/bin/clamui-scheduled-scan --targets ~/Downloads --scheduled
+/usr/bin/clamui-scheduled-scan --target ~/Downloads
 ```
 
 **Check for errors:**
@@ -1236,7 +1253,7 @@ If you don't see it, your desktop notification system may not be working.
 
 ```bash
 clamui-scheduled-scan --help
-clamui-scheduled-scan --targets ~/Downloads --scheduled
+clamui-scheduled-scan --target ~/Downloads
 ```
 
 ---
@@ -1477,7 +1494,7 @@ lsblk -o NAME,ROTA,TYPE,SIZE,MOUNTPOINT
 
 ```bash
 # Run scan with low priority
-nice -n 19 clamui-scheduled-scan --targets ~/Downloads
+nice -n 19 clamui-scheduled-scan --target ~/Downloads
 
 # Or for systemd (edit service file):
 nano ~/.config/systemd/user/clamui-scheduled-scan.service
@@ -1591,11 +1608,16 @@ If you're still experiencing issues after trying these solutions:
 3. **Report an issue:**
     - Visit [GitHub Issues](https://github.com/linx-systems/clamui/issues)
     - Include: OS version, ClamAV version, exact error message, steps to reproduce
-    - Attach relevant logs from Logs view
+    - Attach scan/update logs from the **Logs** view
+    - For deeper diagnostics, attach a debug-log bundle: Preferences → **Debug** → **Export Logs** writes a
+      privacy-redacted ZIP (file paths, hashes, and report URLs are stripped). Raise verbosity first with
+      Preferences → **Debug** → **Log Level** (the `debug_log_level` setting), reproduce the issue, then export.
+      Debug logs live in `~/.local/share/clamui/debug/`, separate from the scan/update history in
+      `~/.local/share/clamui/logs/`.
 
 4. **Get help:**
     - Check the [FAQ](faq.md) for common questions
-    - Review [DEVELOPMENT.md](./DEVELOPMENT.md) for technical details
+    - Review [DEVELOPMENT.md](../DEVELOPMENT.md) for technical details
 
 💡 **Tip:** When troubleshooting, start with the simplest solution first:
 

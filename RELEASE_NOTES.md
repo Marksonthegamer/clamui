@@ -1,29 +1,35 @@
-# ClamUI v0.1.6
+# ClamUI v0.3.0
 
-Security hardening, daemon-scanner fixes, and release pipeline updates.
+Privileged ClamAV configuration improvements, Flatpak host-config fixes, CLI scan reliability, and security hardening.
 
 ## Highlights
 
-### Scanner Reliability
-- Fixed daemon scanning behavior that could miss EICAR detections when `--fdpass` was used
-- Corrected clamd streaming and size-limit unit handling
-- Restored `clamdscan` detection for live-progress scans
-- Improved handling for non-UTF-8 scanner output
+### Configuration & Flatpak
+
+- **Privileged helper installer** — `clamui install-privileged-helper` installs the `clamui-apply-preferences` wrapper and polkit policy needed for elevated ClamAV configuration writes. (#143)
+- **Flatpak host configuration persistence** — Flatpak preferences now persist host ClamAV configuration through the privileged helper instead of assuming sandbox-local ClamAV paths. (#136)
+- **Less unnecessary elevation** — ClamUI skips elevation prompts when it is already running as root and fixes elevation decision/reporting edge cases.
+
+### Scan & CLI Reliability
+
+- **CLI path handling fixed** — one-shot CLI scans now scan every path provided on the command line instead of only the first path.
+- **Saved scan settings honored** — scheduled and one-shot CLI scans now apply saved exclusions and backend settings consistently.
+- **Benign ClamAV warnings tolerated** — scans no longer fail solely because ClamAV reports expected size-limit warnings.
+- **Database age parsing fixed** — ClamUI now parses CVD/CLD database headers robustly even when compressed database payload bytes immediately follow the header.
 
 ### Security Hardening
-- Validated destination paths in the privileged config helper
-- Eliminated shell injection risk in updater force-update flows
-- Addressed additional static-analysis and CodeQL findings
 
-### Dependencies and CI
-- Refreshed dependency pins including `cryptography`, `requests`, `numpy`, `Pillow`, `charset-normalizer`, and `more-itertools`
-- Added a dedicated dependency-audit GitHub Actions workflow
-- Updated GPG import action usage for Node 24 compatibility
+- Sanitized untrusted profile, scan, quarantine, audit, and terminal output paths to reduce log/terminal injection risk.
+- Hardened profile import/name normalization, scheduler quoting, Unicode sanitizer coverage, ClamAV config parsing, quarantine cleanup, and audit verdict handling.
+- Improved exclusion matching bounds in scanner and daemon scanner paths and preserved detections on ClamAV error exits.
 
-## User-Facing Fixes
+### VirusTotal, UI & Packaging
 
-- Fixed tray profile selection navigation
-- Clarified follow-up quality fixes across scanner and release paths
+- VirusTotal retries now resend the full request body, large uploads are supported, and all engine-result buckets are counted.
+- VirusTotal result flow, stuck spinners, tray resynchronization, and deliberate tray shutdown behavior were repaired.
+- AppImage execution now strips bundled Python/GI environment variables before launching host tools. (#155)
+- Debian packaging accepts `pkexec | policykit-1` for Debian 13 compatibility.
+- Python, Flatpak, website, and translation assets were refreshed, and a real-GTK construction smoke test now covers all views, preference pages, and dialogs.
 
 ## Install
 
@@ -32,10 +38,16 @@ Security hardening, daemon-scanner fixes, and release pipeline updates.
 flatpak install flathub io.github.linx_systems.ClamUI
 ```
 
-**GitHub Release**: Download from the [Releases page](https://github.com/linx-systems/clamui/releases/tag/v0.1.6)
+**AppImage**: Download `ClamUI-0.3.0-x86_64.AppImage` from the [Releases page](https://github.com/linx-systems/clamui/releases/tag/v0.3.0).
+
+**GitHub Release**: Download packages from the [Releases page](https://github.com/linx-systems/clamui/releases/tag/v0.3.0).
 
 **From source**:
 ```bash
 git clone https://github.com/linx-systems/clamui.git
 cd clamui && uv sync && uv run clamui
 ```
+
+## Contributors
+
+Thanks to everyone who contributed code, translations, and bug reports for this release. See the [full commit log](https://github.com/linx-systems/clamui/compare/v0.2.0...v0.3.0) for details.

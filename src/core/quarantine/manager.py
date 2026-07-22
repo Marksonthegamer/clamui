@@ -12,12 +12,15 @@ Orchestrates the QuarantineDatabase and SecureFileHandler to provide:
 """
 
 import logging
+import os
+import stat
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from gi.repository import GLib
 
@@ -27,6 +30,9 @@ from .file_handler import (
     FileOperationStatus,
     SecureFileHandler,
 )
+
+if TYPE_CHECKING:
+    from ..settings_manager import SettingsManager
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +66,27 @@ class QuarantineResult:
         return self.status == QuarantineStatus.SUCCESS
 
 
+def _resolve_configured_directory(
+    settings_manager: "SettingsManager | None" = None,
+) -> str | None:
+    """Resolve the user-configured quarantine directory from settings.
+
+    Returns the configured path string, or ``None`` to use the default
+    (``XDG_DATA_HOME/clamui/quarantine``). Any failure to read settings
+    falls back to the default so quarantine never breaks on bad config.
+    """
+    try:
+        if settings_manager is None:
+            from ..settings_manager import SettingsManager
+
+            settings_manager = SettingsManager()
+        configured = settings_manager.get("quarantine_directory", "")
+    except Exception:
+        logger.debug("Could not read quarantine_directory setting; using default", exc_info=True)
+        return None
+    return configured if isinstance(configured, str) and configured else None
+
+
 class QuarantineManager:
     """
     Manager for quarantine operations orchestrating database and file handling.
@@ -91,18 +118,26 @@ class QuarantineManager:
         quarantine_directory: str | None = None,
         database_path: str | None = None,
         enable_periodic_cleanup: bool = True,
+        settings_manager: "SettingsManager | None" = None,
     ):
         """
         Initialize the QuarantineManager.
 
         Args:
             quarantine_directory: Optional custom quarantine directory path.
-                                  Defaults to XDG_DATA_HOME/clamui/quarantine
+                                  When ``None``, the ``quarantine_directory``
+                                  user setting is honored; if that is empty it
+                                  falls back to XDG_DATA_HOME/clamui/quarantine.
             database_path: Optional custom database path.
                            Defaults to XDG_DATA_HOME/clamui/quarantine.db
             enable_periodic_cleanup: Whether to enable periodic orphan cleanup.
                                      Defaults to True. Set to False for testing.
+            settings_manager: Optional SettingsManager used to resolve the
+                              ``quarantine_directory`` setting when no explicit
+                              directory is given. Created on demand if omitted.
         """
+        if quarantine_directory is None:
+            quarantine_directory = _resolve_configured_directory(settings_manager)
         self._file_handler = SecureFileHandler(quarantine_directory)
         self._database = QuarantineDatabase(database_path)
 
@@ -151,8 +186,11 @@ class QuarantineManager:
             ...     print(f"Quarantined at: {result.entry.quarantine_path}")
         """
         with self._lock:
-            source = Path(file_path).resolve()
-            source_str = str(source)
+            # Use abspath, not resolve(): resolve() follows symlinks, which would let an
+            # attacker swap the scanned file for a symlink between scan and quarantine,
+            # bypassing the O_NOFOLLOW guard in move_to_quarantine(). abspath() normalises
+            # . and .. components without dereferencing any symlink in the path.
+            source_str = os.path.abspath(file_path)
 
             # Move file to quarantine (duplicate paths allowed - each gets unique ID)
             file_result = self._file_handler.move_to_quarantine(source_str, threat_name)
@@ -311,6 +349,14 @@ class QuarantineManager:
                     entry_id,
                     entry.quarantine_path,
                 )
+                return QuarantineResult(
+                    status=QuarantineStatus.DATABASE_ERROR,
+                    entry=entry,
+                    error_message=_(
+                        "File restored successfully, but the database entry could not "
+                        "be removed. It may still appear in the list until cleaned up."
+                    ),
+                )
 
             return QuarantineResult(
                 status=QuarantineStatus.SUCCESS,
@@ -394,6 +440,14 @@ class QuarantineManager:
                     "Run cleanup_orphaned_entries() to resolve.",
                     entry_id,
                     entry.quarantine_path,
+                )
+                return QuarantineResult(
+                    status=QuarantineStatus.DATABASE_ERROR,
+                    entry=entry,
+                    error_message=_(
+                        "File deleted successfully, but the database entry could not "
+                        "be removed. It may still appear in the list until cleaned up."
+                    ),
                 )
 
             return QuarantineResult(
@@ -544,9 +598,15 @@ class QuarantineManager:
         if entry is None:
             return (False, _("Quarantine entry not found: {id}").format(id=entry_id))
 
-        quarantine_path = Path(entry.quarantine_path)
-        if not quarantine_path.exists():
+        # lstat() does not follow symlinks — a symlink in the quarantine dir
+        # would not be treated as a present regular file.
+        try:
+            st = os.lstat(entry.quarantine_path)
+        except OSError:
             return (False, f"Quarantine file missing: {entry.quarantine_path}")
+
+        if not stat.S_ISREG(st.st_mode):
+            return (False, f"Quarantine path is not a regular file: {entry.quarantine_path}")
 
         return (True, None)
 
@@ -568,8 +628,14 @@ class QuarantineManager:
             removed_count = 0
 
             for entry in entries:
-                quarantine_path = Path(entry.quarantine_path)
-                if not quarantine_path.exists():
+                # lstat() does not follow symlinks — avoids a stale symlink in the
+                # quarantine dir masking a missing file.
+                try:
+                    st = os.lstat(entry.quarantine_path)
+                    file_present = stat.S_ISREG(st.st_mode)
+                except OSError:
+                    file_present = False
+                if not file_present:
                     logger.warning(
                         "Removing orphaned quarantine entry %d: file missing at %s",
                         entry.id,
@@ -718,21 +784,31 @@ class QuarantineManager:
             Number of entries removed
         """
         with self._lock:
-            # Get old entries
             old_entries = self.get_old_entries(days)
 
-            # Delete each file
+            removed = 0
             for entry in old_entries:
                 try:
-                    self._file_handler.delete_from_quarantine(entry.quarantine_path)
+                    file_result = self._file_handler.delete_from_quarantine(entry.quarantine_path)
+                    file_gone = file_result.is_success or (
+                        file_result.status == FileOperationStatus.FILE_NOT_FOUND
+                    )
                 except Exception as e:
-                    # Continue even if file deletion fails
+                    # Treat an unexpected failure as "file still present" and keep the
+                    # DB row, so the file stays tracked and retryable instead of
+                    # leaking an untracked file on disk.
+                    file_gone = False
                     logger.warning(
                         "Failed to delete quarantined file %s: %s", entry.quarantine_path, e
                     )
 
-            # Remove from database
-            return self._database.cleanup_old_entries(days)
+                # Only drop the DB row once its file is actually gone. Removing the row
+                # while the file remains would orphan it: cleanup_orphaned_entries only
+                # prunes rows whose files are missing, so it could never reclaim it.
+                if file_gone and self._database.remove_entry(entry.id):
+                    removed += 1
+
+            return removed
 
     def cleanup_old_entries_async(
         self,

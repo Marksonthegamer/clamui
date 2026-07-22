@@ -238,13 +238,20 @@ class LoggingConfig:
             dir=self._log_dir,
         )
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
+            try:
+                f = os.fdopen(fd, "w", encoding="utf-8")
+            except Exception:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                raise
+
+            with f:
                 f.write(str(DEBUG_LOG_PRIVACY_VERSION))
 
             state_file = self._get_privacy_state_file_unlocked()
             Path(temp_path).replace(state_file)
             state_file.chmod(0o600)
-        except OSError:
+        except Exception:
             with contextlib.suppress(OSError):
                 Path(temp_path).unlink(missing_ok=True)
 

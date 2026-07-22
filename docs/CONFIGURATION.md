@@ -94,11 +94,10 @@ All XDG paths are relative to this sandbox directory:
 
 - XDG environment variables still work but are interpreted within the sandbox
 - The Flatpak version can access the host filesystem through permissions
-- ClamAV is **bundled inside the Flatpak sandbox** — no host installation required
-- Exception: The daemon scan backend (`"scan_backend": "daemon"`) requires clamd installed on the host system
-- The bundled ClamAV is only available to ClamUI and is not installed system-wide
-- Virus definitions are stored within the Flatpak data directory
-- `flatpak-spawn --host` is used only for systemctl commands (scheduled scan timers)
+- ClamAV is **not bundled** in the Flatpak; install `clamscan` and `freshclam` on the host system
+- The daemon scan backend (`"scan_backend": "daemon"`) requires host `clamd`/`clamdscan`
+- Virus definitions are managed by host ClamAV, normally under `/var/lib/clamav`
+- `flatpak-spawn --host` is used for host ClamAV tools, systemctl commands, and configuration helpers
 
 **Accessing Flatpak Files:**
 To access ClamUI configuration or logs when using Flatpak:
@@ -256,8 +255,9 @@ Specifies a custom directory for storing quarantined files.
 When set to an empty string (default), ClamUI uses the XDG-compliant location `~/.local/share/clamui/quarantine/`. You
 can override this with a custom path for centralized quarantine storage or to use a separate partition.
 
-The specified directory must be writable by the user running ClamUI. Quarantined files are stored with encrypted names
-and tracked in a SQLite database.
+The specified directory must be writable by the user running ClamUI. Quarantined files are stored with randomized
+names and restrictive permissions (`0o400`), and tracked in a SQLite database that stays at the default location.
+Changing this setting affects newly quarantined files; files already in quarantine remain where they are.
 
 **Example:**
 
@@ -311,6 +311,7 @@ Defines how often scheduled scans run.
 
 **Description:**
 
+- **`"hourly"`**: Scans run once per hour
 - **`"daily"`**: Scans run every day at the time specified in `schedule_time`
 - **`"weekly"`**: Scans run once per week on the day specified in `schedule_day_of_week`
 - **`"monthly"`**: Scans run once per month on the day specified in `schedule_day_of_month`
@@ -581,10 +582,12 @@ Selects which ClamAV scanning engine to use.
 Specifies the path to the clamd Unix domain socket.
 
 **Description:**
-When set to an empty string (default), ClamUI automatically detects the socket location by checking these paths:
+When set to an empty string (default), ClamUI auto-detects the socket location. It first reads the `LocalSocket`
+value from `clamd.conf` (if present), then probes these well-known paths in order:
 
 - `/var/run/clamav/clamd.ctl` (Ubuntu/Debian)
 - `/run/clamav/clamd.ctl` (alternative)
+- `/run/clamd.scan/clamd.sock` (Fedora/RHEL)
 - `/var/run/clamd.scan/clamd.sock` (Fedora)
 
 You can override auto-detection by specifying a custom socket path. This is necessary if your distribution uses a

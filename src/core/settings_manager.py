@@ -5,6 +5,7 @@ Stores user settings in JSON format following XDG conventions.
 """
 
 import contextlib
+import copy
 import json
 import logging
 import os
@@ -82,7 +83,10 @@ class SettingsManager:
         "freshclam_conf_path": "",  # Empty = auto-detect
         "clamd_size_limit_unit_migration_done": False,
         # VirusTotal settings
-        "virustotal_api_key": None,  # Fallback storage if keyring unavailable
+        "virustotal_api_key": None,  # Fallback storage if keyring unavailable (gated by
+        # allow_plaintext_api_key_fallback — default False, key is only written here
+        # when the user has explicitly opted in via preferences)
+        "allow_plaintext_api_key_fallback": False,
         "virustotal_remember_no_key_action": "none",  # "none", "open_website", "prompt"
         # Debug logging settings
         "debug_log_level": "WARNING",  # "DEBUG", "INFO", "WARNING", "ERROR"
@@ -139,16 +143,16 @@ class SettingsManager:
                         if not isinstance(loaded, dict):
                             # Non-dict JSON (arrays, null, primitives) is invalid
                             self._backup_corrupted_file()
-                            return dict(self.DEFAULT_SETTINGS)
+                            return copy.deepcopy(self.DEFAULT_SETTINGS)
                         # Merge with defaults to ensure all keys exist
-                        return {**self.DEFAULT_SETTINGS, **loaded}
+                        return {**copy.deepcopy(self.DEFAULT_SETTINGS), **loaded}
             except json.JSONDecodeError:
                 # Handle corrupted files - backup for debugging
                 self._backup_corrupted_file()
             except (OSError, PermissionError):
                 # Handle permission issues silently
                 logger.debug("Failed to load settings file %s", self._settings_file, exc_info=True)
-            return dict(self.DEFAULT_SETTINGS)
+            return copy.deepcopy(self.DEFAULT_SETTINGS)
 
     def save(self) -> bool:
         """
@@ -173,7 +177,14 @@ class SettingsManager:
                     dir=self._config_dir,
                 )
                 try:
-                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    try:
+                        f = os.fdopen(fd, "w", encoding="utf-8")
+                    except Exception:
+                        with contextlib.suppress(OSError):
+                            os.close(fd)
+                        raise
+
+                    with f:
                         json.dump(self._settings, f, indent=2)
 
                     # Atomic rename
@@ -271,7 +282,7 @@ class SettingsManager:
         changed_values: dict[str, Any] = {}
         with self._lock:
             previous_settings = dict(self._settings)
-            self._settings = dict(self.DEFAULT_SETTINGS)
+            self._settings = copy.deepcopy(self.DEFAULT_SETTINGS)
             changed_keys = set(previous_settings) | set(self._settings)
             for key in changed_keys:
                 new_value = self._settings.get(key)

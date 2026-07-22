@@ -119,6 +119,31 @@ class TestLogEntry:
         assert entry.path == "/home/user"
         assert entry.duration == 120.5
 
+    def test_from_dict_regenerates_traversal_id(self):
+        """Test from_dict rejects a path-traversal id and regenerates a safe one."""
+        import uuid
+
+        malicious = {
+            "id": "../../etc/passwd",
+            "timestamp": "2024-01-16T14:00:00",
+            "type": "scan",
+            "status": "clean",
+            "summary": "x",
+            "details": "y",
+        }
+        entry = LogEntry.from_dict(malicious)
+
+        # The traversal id must not survive; a valid UUID is generated instead.
+        assert entry.id != "../../etc/passwd"
+        assert "/" not in entry.id
+        uuid.UUID(entry.id)  # raises ValueError if not a valid UUID
+
+    def test_from_dict_preserves_valid_id(self):
+        """Test from_dict keeps an id matching the strict pattern."""
+        data = {"id": "abc_DEF-123", "summary": "ok"}
+        entry = LogEntry.from_dict(data)
+        assert entry.id == "abc_DEF-123"
+
     def test_from_dict_with_missing_fields(self):
         """Test LogEntry.from_dict handles missing fields gracefully."""
         data = {"summary": "Partial data"}
@@ -133,6 +158,40 @@ class TestLogEntry:
         assert entry.details == ""
         assert entry.path is None
         assert entry.duration == 0.0
+
+    def test_from_dict_coerces_nonnumeric_duration(self):
+        """Test from_dict coerces a null/non-numeric duration to a float.
+
+        A tampered or corrupt stored log with ``"duration": null`` (or a
+        string) must not leave a non-float on the entry, which would crash
+        downstream arithmetic (statistics aggregation) and comparisons
+        (CSV export ``entry.duration > 0``).
+        """
+        # null duration (key present, value None) must become 0.0, not None
+        entry_null = LogEntry.from_dict(
+            {
+                "id": "dur-null",
+                "timestamp": "2024-01-01T00:00:00",
+                "type": "scan",
+                "status": "clean",
+                "summary": "s",
+                "details": "d",
+                "duration": None,
+            }
+        )
+        assert entry_null.duration == 0.0
+        assert isinstance(entry_null.duration, float)
+        # Comparison used by CSV export must not raise
+        assert (entry_null.duration > 0) is False
+
+        # numeric string is coerced to float
+        entry_str = LogEntry.from_dict({"id": "dur-str", "duration": "12.5"})
+        assert entry_str.duration == 12.5
+        assert isinstance(entry_str.duration, float)
+
+        # garbage string falls back to 0.0 instead of crashing
+        entry_bad = LogEntry.from_dict({"id": "dur-bad", "duration": "abc"})
+        assert entry_bad.duration == 0.0
 
     def test_roundtrip_serialization(self):
         """Test that to_dict and from_dict are reversible."""
@@ -782,6 +841,30 @@ class TestLogManager:
         result = log_manager.delete_log("non-existent-id")
         assert result is False
 
+    def test_get_log_by_id_rejects_path_traversal(self, log_manager, temp_log_dir):
+        """Test get_log_by_id with a traversal id cannot read outside the log dir."""
+        # Plant a victim file in the parent of the log dir.
+        victim = Path(temp_log_dir).parent / "victim.json"
+        victim.write_text('{"id": "victim", "summary": "secret"}', encoding="utf-8")
+        try:
+            # ".../<log_dir>/../victim.json" must not resolve/read the victim.
+            assert log_manager.get_log_by_id("../victim") is None
+            assert log_manager.get_log_by_id("../../etc/passwd") is None
+        finally:
+            victim.unlink()
+
+    def test_delete_log_rejects_path_traversal(self, log_manager, temp_log_dir):
+        """Test delete_log with a traversal id cannot delete outside the log dir."""
+        victim = Path(temp_log_dir).parent / "victim.json"
+        victim.write_text("important", encoding="utf-8")
+        try:
+            assert log_manager.delete_log("../victim") is False
+            assert log_manager.delete_log("../../etc/passwd") is False
+            # The out-of-tree file must still exist.
+            assert victim.exists()
+        finally:
+            victim.unlink()
+
     def test_clear_logs(self, log_manager, temp_log_dir):
         """Test clearing all logs."""
         # Create several entries
@@ -872,16 +955,37 @@ class TestLogManagerDaemonStatus:
     def test_get_daemon_status_stopped(self, log_manager):
         """Test daemon status when clamd service is installed but not active."""
         with mock.patch("src.core.log_manager.which_host_command", return_value="/usr/bin/clamd"):
-            with mock.patch("subprocess.run") as mock_run:
-                mock_run.side_effect = [
-                    mock.Mock(stdout="failed\n"),
-                    mock.Mock(stdout="unknown\n"),
-                    mock.Mock(stdout="unknown\n"),
-                    mock.Mock(returncode=1),
-                ]
-                status, message = log_manager.get_daemon_status()
-                assert status == DaemonStatus.STOPPED
-                assert "not active" in message.lower()
+            with mock.patch(
+                "src.core.clamav_detection.systemd_unit_exists", return_value=True
+            ) as mock_exists:
+                with mock.patch("subprocess.run") as mock_run:
+                    mock_run.side_effect = [
+                        mock.Mock(stdout="failed\n"),
+                        mock.Mock(stdout="unknown\n"),
+                        mock.Mock(stdout="unknown\n"),
+                        mock.Mock(returncode=1),
+                    ]
+                    status, message = log_manager.get_daemon_status()
+                    assert status == DaemonStatus.STOPPED
+                    assert "not active" in message.lower()
+                    mock_exists.assert_called_once_with("clamav-daemon.service")
+
+    def test_get_daemon_status_not_installed_when_units_unknown(self, log_manager):
+        """systemd reports 'inactive' even for unknown units; without a clamd
+        binary and with no real unit, the status must be NOT_INSTALLED rather
+        than 'installed but not active'."""
+        with mock.patch("src.core.log_manager.which_host_command", return_value=None):
+            with mock.patch("src.core.clamav_detection.systemd_unit_exists", return_value=False):
+                with mock.patch("subprocess.run") as mock_run:
+                    mock_run.side_effect = [
+                        mock.Mock(stdout="inactive\n"),
+                        mock.Mock(stdout="inactive\n"),
+                        mock.Mock(stdout="inactive\n"),
+                        mock.Mock(returncode=1),
+                    ]
+                    status, message = log_manager.get_daemon_status()
+                    assert status == DaemonStatus.NOT_INSTALLED
+                    assert "not installed" in message.lower()
 
     def test_get_daemon_status_falls_back_to_process_when_systemctl_fails(self, log_manager):
         """Test daemon status falls back to pgrep when systemctl calls fail."""
@@ -985,6 +1089,41 @@ class TestLogManagerDaemonLogs:
                     assert "empty" in content.lower()
         finally:
             os.unlink(temp_log_path)
+
+    def test_read_daemon_logs_tail_passes_clean_env(self, log_manager):
+        """The tail host helper receives the sanitized environment."""
+        clean_env = {"PATH": "/usr/bin:/bin", "HOME": "/home/user"}
+        with (
+            mock.patch.object(log_manager, "get_daemon_log_path", return_value="/var/log/clamd.log"),
+            mock.patch("src.core.log_manager.wrap_host_command", side_effect=lambda cmd: cmd),
+            mock.patch("src.core.log_manager.get_clean_env", return_value=clean_env),
+            mock.patch(
+                "subprocess.run",
+                return_value=mock.MagicMock(returncode=0, stdout="Line 1\n"),
+            ) as mock_run,
+        ):
+            success, content = log_manager.read_daemon_logs(num_lines=5)
+
+        assert success is True
+        assert mock_run.call_args.args[0][0] == "tail"
+        assert mock_run.call_args.kwargs["env"] is clean_env
+
+    def test_read_daemon_logs_journalctl_passes_clean_env(self, log_manager):
+        """The journalctl host helper receives the sanitized environment."""
+        clean_env = {"PATH": "/usr/bin:/bin", "HOME": "/home/user"}
+        with (
+            mock.patch("src.core.log_manager.wrap_host_command", side_effect=lambda cmd: cmd),
+            mock.patch("src.core.log_manager.get_clean_env", return_value=clean_env),
+            mock.patch(
+                "subprocess.run",
+                return_value=mock.MagicMock(returncode=0, stdout="journal line\n"),
+            ) as mock_run,
+        ):
+            success, content = log_manager._read_daemon_logs_journalctl(num_lines=5)
+
+        assert success is True
+        assert mock_run.call_args.args[0][0] == "journalctl"
+        assert mock_run.call_args.kwargs["env"] is clean_env
 
 
 class TestLogType:

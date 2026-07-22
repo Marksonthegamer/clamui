@@ -137,8 +137,8 @@ import io
 import json
 import logging
 import os
-import random
 import re
+import secrets
 import subprocess
 import tempfile
 import threading
@@ -170,6 +170,11 @@ _INDEX_FIELD_PATTERN = re.compile(r'"(id|timestamp|type)"\s*:\s*"([^"\\]*(?:\\.[
 # Total ~122 bytes minimum. Using 512 bytes provides safety margin for
 # whitespace variations and ensures we capture all three fields.
 _INDEX_EXTRACT_MAX_BYTES = 512
+
+# Valid log entry id: UUIDs and any opaque token of word chars / dashes. Used to
+# reject ids ingested from on-disk JSON or the index before they reach a
+# filesystem path, preventing path traversal (e.g. "../../etc/passwd").
+_VALID_LOG_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def _sanitize_private_line(text: str | None) -> str:
@@ -501,23 +506,40 @@ class LogEntry:
         tampering with stored log files or reading maliciously crafted log entries.
         """
         # Extract and sanitize fields
-        # IDs and timestamps are system-controlled, don't need sanitization
+        # Timestamps are system-controlled, don't need sanitization.
+        # The id flows into a filesystem path on read/delete, so reject ids that
+        # don't match the strict pattern and regenerate a safe one (prevents path
+        # traversal from tampered/crafted log files, e.g. "../../etc/passwd").
+        raw_id = data.get("id")
+        log_id = (
+            raw_id
+            if isinstance(raw_id, str) and _VALID_LOG_ID_PATTERN.match(raw_id)
+            else str(uuid.uuid4())
+        )
         # Type and status should be controlled enums but sanitize for defense in depth
         raw_summary = data.get("summary", "")
         raw_details = data.get("details", "")
         raw_status = data.get("status", "unknown")
         raw_type = data.get("type", "unknown")
         raw_path = data.get("path")
+        # duration is annotated float; coerce defensively so a tampered/corrupt
+        # stored log with a null or non-numeric duration cannot crash downstream
+        # arithmetic (statistics aggregation) or comparisons (CSV export).
+        raw_duration = data.get("duration", 0.0)
+        try:
+            duration = float(raw_duration)
+        except (TypeError, ValueError):
+            duration = 0.0
 
         return cls(
-            id=data.get("id", str(uuid.uuid4())),
+            id=log_id,
             timestamp=data.get("timestamp", datetime.now().isoformat()),
             type=_sanitize_private_line(raw_type),
             status=_sanitize_private_line(raw_status),
             summary=_sanitize_private_line(raw_summary),
             details=_sanitize_private_text(raw_details),
             path=sanitize_log_line(raw_path) if raw_path else None,
-            duration=data.get("duration", 0.0),
+            duration=duration,
             scheduled=data.get("scheduled", False),
         )
 
@@ -801,12 +823,19 @@ class LogManager:
 
         fd, temp_path = tempfile.mkstemp(prefix="log_privacy_", dir=self._log_dir)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
+            try:
+                f = os.fdopen(fd, "w", encoding="utf-8")
+            except Exception:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                raise
+
+            with f:
                 f.write(str(LOG_PRIVACY_VERSION))
 
             Path(temp_path).replace(self._privacy_state_path)
             self._privacy_state_path.chmod(0o600)
-        except OSError:
+        except Exception:
             with contextlib.suppress(OSError):
                 Path(temp_path).unlink(missing_ok=True)
 
@@ -897,7 +926,14 @@ class LogManager:
                 dir=self._log_dir,
             )
             try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                try:
+                    f = os.fdopen(fd, "w", encoding="utf-8")
+                except Exception:
+                    with contextlib.suppress(OSError):
+                        os.close(fd)
+                    raise
+
+                with f:
                     json.dump(index_data, f, indent=2)
 
                 # Atomic rename
@@ -953,8 +989,9 @@ class LogManager:
             # If we have many entries, check a sample; otherwise check all
             entries_to_check = index_entries
             if len(index_entries) > 50:
-                # Sample 50 entries for large indices
-                entries_to_check = random.sample(index_entries, 50)
+                # Sample 50 entries for large indices. Use a CSPRNG so an
+                # attacker cannot predict which entries are verified.
+                entries_to_check = secrets.SystemRandom().sample(index_entries, 50)
 
             # Use set membership for O(1) lookup instead of exists() syscalls
             missing_count = sum(
@@ -1058,7 +1095,14 @@ class LogManager:
             dir=self._log_dir,
         )
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
+            try:
+                f = os.fdopen(fd, "w", encoding="utf-8")
+            except Exception:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                raise
+
+            with f:
                 json.dump(data, f, indent=2)
 
             Path(temp_path).replace(log_file)
@@ -1368,6 +1412,24 @@ class LogManager:
         # Apply limit
         return entries[:limit]
 
+    def _safe_log_file(self, log_id: str | None) -> Path | None:
+        """
+        Resolve <log_id>.json inside the log directory, rejecting traversal.
+
+        Returns None when the id is missing, fails the strict id pattern, or the
+        constructed path would escape the log directory (defense-in-depth against
+        a tampered id reaching open()/unlink()).
+        """
+        if not log_id or not _VALID_LOG_ID_PATTERN.match(log_id):
+            return None
+        log_file = self._log_dir / f"{log_id}.json"
+        try:
+            if not log_file.resolve().is_relative_to(self._log_dir.resolve()):
+                return None
+        except OSError:
+            return None
+        return log_file
+
     def _load_log_entries_by_ids(self, index_entries: list[dict]) -> list[LogEntry]:
         """
         Load LogEntry objects for the given index entries.
@@ -1384,8 +1446,8 @@ class LogManager:
             if not log_id:
                 continue
             try:
-                log_file = self._log_dir / f"{log_id}.json"
-                if log_file.exists():
+                log_file = self._safe_log_file(log_id)
+                if log_file is not None and log_file.exists():
                     with open(log_file, encoding="utf-8") as f:
                         data = json.load(f)
                         entries.append(LogEntry.from_dict(data))
@@ -1542,8 +1604,8 @@ class LogManager:
         with self._lock:
             try:
                 self._check_and_run_privacy_migration_unlocked()
-                log_file = self._log_dir / f"{log_id}.json"
-                if log_file.exists():
+                log_file = self._safe_log_file(log_id)
+                if log_file is not None and log_file.exists():
                     with open(log_file, encoding="utf-8") as f:
                         data = json.load(f)
                         return LogEntry.from_dict(data)
@@ -1563,8 +1625,8 @@ class LogManager:
         """
         with self._lock:
             try:
-                log_file = self._log_dir / f"{log_id}.json"
-                if log_file.exists():
+                log_file = self._safe_log_file(log_id)
+                if log_file is not None and log_file.exists():
                     log_file.unlink()
 
                     # Update index by removing the deleted entry (best-effort)
@@ -1835,7 +1897,14 @@ class LogManager:
             )
             try:
                 # Write content to temp file
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                try:
+                    f = os.fdopen(fd, "w", encoding="utf-8")
+                except Exception:
+                    with contextlib.suppress(OSError):
+                        os.close(fd)
+                    raise
+
+                with f:
                     f.write(content)
 
                 # Atomic rename (replace target file if it exists)
@@ -1883,7 +1952,14 @@ class LogManager:
                 if status_text == "active":
                     return (DaemonStatus.RUNNING, f"{service_name} is active")
                 if status_text in {"inactive", "failed", "activating", "deactivating"}:
-                    saw_installed_service = True
+                    # "inactive" alone doesn't prove the unit exists: systemd
+                    # prints it for units it has never heard of, which would
+                    # misreport a machine with no clamd at all as
+                    # "installed but not active". Confirm via LoadState.
+                    from .clamav_detection import systemd_unit_exists
+
+                    if systemd_unit_exists(service_name):
+                        saw_installed_service = True
             except (subprocess.SubprocessError, FileNotFoundError, OSError):
                 logger.debug("systemctl is-active failed for %s", service_name, exc_info=True)
 
@@ -2009,7 +2085,9 @@ class LogManager:
             try:
                 # Use tail command - wrapped for Flatpak host access
                 tail_cmd = wrap_host_command(["tail", "-n", str(num_lines), log_path])
-                result = subprocess.run(tail_cmd, capture_output=True, text=True, timeout=10)
+                result = subprocess.run(
+                    tail_cmd, capture_output=True, text=True, timeout=10, env=get_clean_env()
+                )
 
                 if result.returncode == 0:
                     content = result.stdout
@@ -2087,7 +2165,9 @@ class LogManager:
                         "-q",  # Quiet - suppress info messages
                     ]
                 )
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=10, env=get_clean_env()
+                )
 
                 if result.returncode == 0 and result.stdout.strip():
                     return (True, _sanitize_private_text(result.stdout))

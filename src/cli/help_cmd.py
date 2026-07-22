@@ -61,6 +61,12 @@ _COMMANDS: dict[str, dict[str, str | list[str]]] = {
             "clamui history --type scan --json",
         ],
     },
+    "install-privileged-helper": {
+        "summary": N_("Install the polkit helper for saving system ClamAV configs"),
+        "examples": [
+            "sudo clamui install-privileged-helper",
+        ],
+    },
     "help": {
         "summary": N_("Show this help message"),
         "examples": [

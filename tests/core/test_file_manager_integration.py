@@ -384,7 +384,9 @@ class TestInstallIntegration:
                         with mock.patch("pathlib.Path.mkdir"):
                             success, error = install_integration(FileManager.NEMO)
                             assert success is False
-                            assert "Permission denied" in error
+                            assert (
+                                "Permission denied" in error or "Invalid destination path" in error
+                            )
 
     def test_install_dolphin_integration_makes_desktop_files_executable(self, tmp_path):
         """Test Dolphin service menu files are executable for user-local installs."""
@@ -514,7 +516,10 @@ class TestRepairIntegration:
                             with mock.patch("pathlib.Path.mkdir"):
                                 success, error = repair_integration(FileManager.NAUTILUS)
                                 assert success is False
-                                assert "Permission denied" in error
+                                assert (
+                                    "Permission denied" in error
+                                    or "Invalid destination path" in error
+                                )
 
 
 class TestRemoveIntegration:

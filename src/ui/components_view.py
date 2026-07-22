@@ -3,6 +3,7 @@
 Components status view for ClamUI displaying ClamAV component availability and setup guides.
 """
 
+import logging
 import threading
 
 import gi
@@ -22,6 +23,8 @@ from ..core.utils import (
 from .compat import safe_add_suffix
 from .utils import add_row_icon, resolve_icon_name
 from .view_helpers import StatusLevel, clear_status_classes, set_status_class
+
+logger = logging.getLogger(__name__)
 
 # Setup guide content for each component
 # NOTE: "title" and "notes" use N_() for deferred translation (translated at display time).
@@ -48,8 +51,9 @@ SETUP_GUIDES = {
         ],
         "notes": N_(
             "freshclam updates the virus database. Enable the service for automatic updates:"
-        )
-        + "\nsudo systemctl enable clamav-freshclam\nsudo systemctl start clamav-freshclam",
+        ),
+        # Shell commands appended verbatim after the translated notes
+        "notes_commands": "sudo systemctl enable clamav-freshclam\nsudo systemctl start clamav-freshclam",
     },
     "clamdscan": {
         "title": N_("clamdscan Installation"),
@@ -78,12 +82,15 @@ SETUP_GUIDES = {
                 "sudo pacman -S clamav\nsudo systemctl enable clamav-daemon\nsudo systemctl start clamav-daemon",
             ),
         ],
-        "notes": N_("clamd is the ClamAV daemon for faster scanning.")
-        + " "
-        + N_("Configuration file location is auto-detected in Preferences.")
-        + " "
-        + N_(
-            "On Fedora, ClamUI uses /etc/clamd.d/scan.conf. If the daemon is running but still unavailable, verify socket permissions and test with: clamdscan --config-file=/etc/clamd.d/scan.conf --ping 3"
+        # A tuple of sentences: each is translated separately at display
+        # time, then joined — concatenating N_() results at module level
+        # would produce msgids that never match the catalog.
+        "notes": (
+            N_("clamd is the ClamAV daemon for faster scanning."),
+            N_("Configuration file location is auto-detected in Preferences."),
+            N_(
+                "On Fedora, ClamUI uses /etc/clamd.d/scan.conf. If the daemon is running but still unavailable, verify socket permissions and test with: clamdscan --config-file=/etc/clamd.d/scan.conf --ping 3"
+            ),
         ),
     },
 }
@@ -179,8 +186,8 @@ class ComponentsView(Gtk.Box):
         if is_flatpak():
             components_group.set_description(
                 _(
-                    "clamscan and freshclam are bundled with the Flatpak. "
-                    "Daemon components run on the host system via flatpak-spawn."
+                    "ClamAV tools must be installed on the host system. "
+                    "Flatpak runs them through flatpak-spawn."
                 )
             )
         else:
@@ -278,32 +285,35 @@ class ComponentsView(Gtk.Box):
         content_box.set_margin_start(12)
         content_box.set_margin_end(12)
 
-        # In Flatpak, clamscan and freshclam are bundled - show a message instead
-        is_flatpak_bundled = is_flatpak() and component_id in ("clamscan", "freshclam")
+        # Add installation commands for each distro
+        commands = guide.get("commands", [])
+        for distro, command in commands:
+            command_row = self._create_command_row(distro, command)
+            content_box.append(command_row)
 
-        if is_flatpak_bundled:
-            self._add_flatpak_bundled_message(content_box, component_id)
-        else:
-            # Add installation commands for each distro
-            commands = guide.get("commands", [])
-            for distro, command in commands:
-                command_row = self._create_command_row(distro, command)
-                content_box.append(command_row)
+        # Add notes if present. "notes" is one N_()-marked string or a tuple
+        # of them; translate each at display time. Any "notes_commands" shell
+        # text is appended verbatim (never translated).
+        notes = guide.get("notes", "")
+        if isinstance(notes, tuple):
+            notes = " ".join(_(part) for part in notes)
+        elif notes:
+            notes = _(notes)
+        notes_commands = guide.get("notes_commands", "")
+        if notes_commands:
+            notes = f"{notes}\n{notes_commands}" if notes else notes_commands
+        if notes:
+            notes_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            notes_box.set_margin_top(6)
 
-            # Add notes if present (not for Flatpak bundled components)
-            notes = guide.get("notes", "")
-            if notes:
-                notes_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-                notes_box.set_margin_top(6)
+            notes_label = Gtk.Label()
+            notes_label.set_markup(f"<small><i>{GLib.markup_escape_text(notes)}</i></small>")
+            notes_label.set_wrap(True)
+            notes_label.set_xalign(0)
+            notes_label.add_css_class("dim-label")
 
-                notes_label = Gtk.Label()
-                notes_label.set_markup(f"<small><i>{GLib.markup_escape_text(notes)}</i></small>")
-                notes_label.set_wrap(True)
-                notes_label.set_xalign(0)
-                notes_label.add_css_class("dim-label")
-
-                notes_box.append(notes_label)
-                content_box.append(notes_box)
+            notes_box.append(notes_label)
+            content_box.append(notes_box)
 
         # Wrap in ActionRow for proper styling
         guide_row = Adw.ActionRow()
@@ -378,52 +388,15 @@ class ComponentsView(Gtk.Box):
         clipboard = button.get_clipboard()
         clipboard.set(command)
 
-        # Visual feedback - change icon temporarily
         button.set_icon_name(resolve_icon_name("object-select-symbolic"))
         GLib.timeout_add(
-            1500, lambda: button.set_icon_name(resolve_icon_name("edit-copy-symbolic"))
+            1500,
+            lambda: (
+                button.set_icon_name(resolve_icon_name("edit-copy-symbolic"))
+                if not self._destroyed
+                else None
+            ),
         )
-
-    def _add_flatpak_bundled_message(self, content_box: Gtk.Box, component_id: str):
-        """
-        Add a message explaining that the component is bundled with Flatpak.
-
-        Args:
-            content_box: The content box to add the message to
-            component_id: Component identifier (clamscan or freshclam)
-        """
-        if component_id == "clamscan":
-            message = _(
-                "clamscan is bundled with the Flatpak package. No installation is required."
-            )
-        else:  # freshclam
-            message = _(
-                "freshclam is bundled with the Flatpak package. "
-                "No installation is required. The virus database is "
-                "automatically stored in the Flatpak sandbox."
-            )
-
-        info_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        info_box.set_margin_start(6)
-        info_box.set_margin_end(6)
-
-        # Info icon
-        info_icon = Gtk.Image()
-        info_icon.set_from_icon_name(resolve_icon_name("info-symbolic"))
-        info_icon.set_icon_size(Gtk.IconSize.LARGE)
-        info_icon.add_css_class("dim-label")
-        info_box.append(info_icon)
-
-        # Message label
-        message_label = Gtk.Label()
-        message_label.set_markup(f"<small>{GLib.markup_escape_text(message)}</small>")
-        message_label.set_wrap(True)
-        message_label.set_xalign(0)
-        message_label.set_yalign(0.5)
-        message_label.add_css_class("dim-label")
-        info_box.append(message_label)
-
-        content_box.append(info_box)
 
     def _create_refresh_header_widget(self, group: Adw.PreferencesGroup):
         """
@@ -500,21 +473,27 @@ class ComponentsView(Gtk.Box):
 
         results = {}
 
-        # Check clamscan
-        results["clamscan"] = check_clamav_installed()
+        try:
+            # Check clamscan
+            results["clamscan"] = check_clamav_installed()
 
-        # Check freshclam
-        results["freshclam"] = check_freshclam_installed()
+            # Check freshclam
+            results["freshclam"] = check_freshclam_installed()
 
-        # Check clamdscan (runs on host via flatpak-spawn in Flatpak mode)
-        results["clamdscan"] = check_clamdscan_installed()
+            # Check clamdscan (runs on host via flatpak-spawn in Flatpak mode)
+            results["clamdscan"] = check_clamdscan_installed()
 
-        # Check clamd daemon (runs on host via flatpak-spawn in Flatpak mode)
-        daemon_status, daemon_message = self._log_manager.get_daemon_status()
-        results["clamd"] = (daemon_status.value, daemon_message)
-
-        if not self._destroyed:
-            GLib.idle_add(self._update_components_ui, results)
+            # Check clamd daemon (runs on host via flatpak-spawn in Flatpak mode)
+            daemon_status, daemon_message = self._log_manager.get_daemon_status()
+            results["clamd"] = (daemon_status.value, daemon_message)
+        except Exception:
+            # A failing subprocess/daemon check must never strand the worker
+            # thread: the UI update (which resets the checking state and stops
+            # the spinner) is always scheduled, even with partial results.
+            logger.exception("Component status check failed")
+        finally:
+            if not self._destroyed:
+                GLib.idle_add(self._update_components_ui, results)
 
     def _update_components_ui(self, results):
         """Update component status UI on the main thread.
@@ -563,18 +542,11 @@ class ComponentsView(Gtk.Box):
         # Remove previous CSS classes
         clear_status_classes(status_icon)
 
-        # Check if component is bundled with Flatpak
-        is_flatpak_bundled = is_flatpak() and component_id in ("clamscan", "freshclam")
-
         if is_installed:
             status_icon.set_from_icon_name(resolve_icon_name("object-select-symbolic"))
             set_status_class(status_icon, StatusLevel.SUCCESS)
-            if is_flatpak_bundled:
-                status_label.set_text(_("Bundled"))
-                expander.set_subtitle(_("Included with Flatpak"))
-            else:
-                status_label.set_text(_("Installed"))
-                expander.set_subtitle(message or _("Installed"))
+            status_label.set_text(_("Installed"))
+            expander.set_subtitle(message or _("Installed"))
 
             # Hide installation guide and disable expander for installed components
             guide_row = self._guide_rows.get(component_id)
@@ -582,24 +554,16 @@ class ComponentsView(Gtk.Box):
                 guide_row.set_visible(False)
             expander.set_enable_expansion(False)
         else:
-            # In Flatpak, bundled components should always be available
-            if is_flatpak_bundled:
-                status_icon.set_from_icon_name(resolve_icon_name("dialog-error-symbolic"))
-                set_status_class(status_icon, StatusLevel.ERROR)
-                status_label.set_text(_("Unavailable"))
-                expander.set_subtitle(_("Flatpak package issue - component should be bundled"))
-                expander.set_enable_expansion(False)
-            else:
-                status_icon.set_from_icon_name(resolve_icon_name("dialog-warning-symbolic"))
-                set_status_class(status_icon, StatusLevel.WARNING)
-                status_label.set_text(_("Not installed"))
-                expander.set_subtitle(_("Not installed - expand for setup instructions"))
+            status_icon.set_from_icon_name(resolve_icon_name("dialog-warning-symbolic"))
+            set_status_class(status_icon, StatusLevel.WARNING)
+            status_label.set_text(_("Not installed"))
+            expander.set_subtitle(_("Not installed - expand for setup instructions"))
 
-                # Show installation guide and enable expander for not installed components
-                guide_row = self._guide_rows.get(component_id)
-                if guide_row:
-                    guide_row.set_visible(True)
-                expander.set_enable_expansion(True)
+            # Show installation guide and enable expander for not installed components
+            guide_row = self._guide_rows.get(component_id)
+            if guide_row:
+                guide_row.set_visible(True)
+            expander.set_enable_expansion(True)
 
     def _update_daemon_status(self, component_id: str, status: DaemonStatus, message: str):
         """

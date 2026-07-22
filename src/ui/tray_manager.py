@@ -49,6 +49,11 @@ class TrayManager:
     isolating GTK3 in a separate process.
     """
 
+    # Bounded-respawn parameters: at most MAX_RESPAWNS within RESPAWN_WINDOW
+    # seconds. Beyond that we declare the tray "down" and stop trying.
+    MAX_RESPAWNS = 3
+    RESPAWN_WINDOW = 60.0
+
     def __init__(self) -> None:
         """Initialize the TrayManager."""
         self._process: subprocess.Popen | None = None
@@ -60,6 +65,15 @@ class TrayManager:
         self._ready = False
         self._current_status = "protected"
 
+        # Crash recovery state (UI-001).
+        # _shutting_down distinguishes deliberate stop() from subprocess crash;
+        # _respawn_count + _last_respawn_time implement a sliding-window
+        # circuit breaker; _tray_down is observable for UI feedback.
+        self._shutting_down = False
+        self._respawn_count = 0
+        self._last_respawn_time = 0.0
+        self._tray_down = False
+
         # Callbacks for menu actions
         self._on_quick_scan: Callable[[], None] | None = None
         self._on_full_scan: Callable[[], None] | None = None
@@ -70,6 +84,8 @@ class TrayManager:
 
         # Profile state
         self._current_profile_id: str | None = None
+        # Last-known menu state, re-pushed to a respawned subprocess on "ready".
+        self._current_profiles: list[dict] = []
 
         # Register for atexit cleanup
         global _atexit_registered
@@ -104,7 +120,7 @@ class TrayManager:
                 except Exception:
                     logger.debug("Failed to close tray subprocess pipe", exc_info=True)
 
-    def start(self) -> bool:
+    def start(self, respawn: bool = False) -> bool:
         """
         Start the tray service subprocess.
 
@@ -114,6 +130,18 @@ class TrayManager:
         if self._process is not None:
             logger.warning("Tray service already running")
             return True
+
+        with self._state_lock:
+            if respawn:
+                # Respawn path: a deliberate stop() that raced ahead of
+                # crash-respawn must win. Do NOT clear _shutting_down here.
+                if self._shutting_down:
+                    logger.info("Tray respawn aborted: shutdown requested")
+                    return False
+            else:
+                # Re-arming after a previous stop() or respawn: clear state.
+                self._shutting_down = False
+                self._tray_down = False
 
         try:
             # Find the tray_service module path
@@ -221,13 +249,97 @@ class TrayManager:
                         continue
 
                     self._handle_message(message)
-                except json.JSONDecodeError as e:
+                except (json.JSONDecodeError, ValueError, RecursionError) as e:
                     logger.error(f"Invalid JSON from tray service: {e}")
+                    continue
 
         except Exception as e:
             logger.error(f"Error reading tray service stdout: {e}")
         finally:
             logger.debug("Tray service stdout reader ended")
+            # UI-001: subprocess EOF means the tray service died. Reset _ready,
+            # capture exit code, and attempt bounded respawn unless we're
+            # shutting down deliberately.
+            self._handle_subprocess_exit()
+
+    def _handle_subprocess_exit(self) -> None:
+        """Handle subprocess EOF / exit detected by the stdout reader.
+
+        On unexpected exit (crash): resets ``_ready``, polls for the exit
+        code, and attempts a bounded respawn (max ``MAX_RESPAWNS`` per
+        ``RESPAWN_WINDOW`` seconds).
+
+        On deliberate shutdown (``_shutting_down`` set, or ``_running``
+        already False): does nothing — the caller of ``stop()`` is the
+        owner of the ``_ready`` flag in that case.
+        """
+        import time
+
+        with self._state_lock:
+            shutting_down = self._shutting_down
+            running = self._running
+            if shutting_down or not running:
+                # Deliberate shutdown — leave _ready alone; stop() handles it.
+                return
+            # Unexpected EOF (subprocess crashed). Reset _ready now.
+            self._ready = False
+
+        # Capture exit code for logging.
+        exit_code: int | None = None
+        if self._process is not None:
+            try:
+                exit_code = self._process.poll()
+            except Exception:
+                logger.debug("Failed to poll tray subprocess for exit code", exc_info=True)
+
+        # poll() returning None means the child is still alive — the reader
+        # ended for another reason. Do NOT respawn, or we'd orphan a live child.
+        if exit_code is None:
+            logger.warning(
+                "Tray subprocess reader ended but child still alive "
+                "(poll()=None); not respawning to avoid orphaning it"
+            )
+            return
+
+        # Sliding-window circuit breaker.
+        now = time.monotonic()
+        with self._state_lock:
+            window_open = (now - self._last_respawn_time) <= self.RESPAWN_WINDOW
+            if window_open and self._respawn_count >= self.MAX_RESPAWNS:
+                self._tray_down = True
+                logger.error(
+                    "Tray subprocess crashed (exit_code=%s); circuit breaker "
+                    "engaged after %d respawns within %.0fs — giving up",
+                    exit_code,
+                    self._respawn_count,
+                    self.RESPAWN_WINDOW,
+                )
+                return
+            if not window_open:
+                # Window expired — reset counter.
+                self._respawn_count = 0
+            self._respawn_count += 1
+            self._last_respawn_time = now
+            # Close the dead process's pipes before dropping the reference —
+            # a crash-looping subprocess would otherwise leak three fds per
+            # respawn. Then clear it so start() will spawn a new one.
+            self._close_pipes()
+            self._process = None
+            self._running = False
+
+        logger.warning(
+            "Tray subprocess exited (exit_code=%s); attempting respawn (%d/%d)",
+            exit_code,
+            self._respawn_count,
+            self.MAX_RESPAWNS,
+        )
+        try:
+            ok = self.start(respawn=True)
+        except Exception:
+            logger.exception("Tray subprocess respawn raised")
+            ok = False
+        if not ok:
+            logger.error("Tray subprocess respawn failed (exit_code=%s)", exit_code)
 
     # Maximum nesting depth for JSON messages
     MAX_NESTING_DEPTH = 10
@@ -296,6 +408,12 @@ class TrayManager:
             with self._state_lock:
                 self._ready = True
             logger.info("Tray service is ready")
+            # Re-push cached state on the GTK main loop. Essential after a crash
+            # respawn (the new subprocess starts from defaults, so the icon would
+            # otherwise show the wrong badge and an empty profile submenu); a
+            # harmless no-op on the initial ready. Marshalled via idle_add so it
+            # does not race other main-thread _send_command writers.
+            GLib.idle_add(self._resync_tray_state)
 
         elif event == "pong":
             logger.debug("Received pong from tray service")
@@ -336,6 +454,28 @@ class TrayManager:
                 logger.warning("select_profile action missing profile_id")
         else:
             logger.warning(f"No handler for action: {action}")
+
+    def _resync_tray_state(self) -> bool:
+        """Re-push cached tray state to the (possibly just-respawned) subprocess.
+
+        Runs on the GTK main loop. After a crash respawn the new subprocess starts
+        from defaults (status "protected", empty submenu); without this the tray
+        would misreport state until the next change. Idempotent on first ready.
+        """
+        with self._state_lock:
+            status = self._current_status
+            profiles = list(self._current_profiles)
+            profile_id = self._current_profile_id
+        self._send_command({"action": "update_status", "status": status})
+        if profiles:
+            self._send_command(
+                {
+                    "action": "update_profiles",
+                    "profiles": profiles,
+                    "current_profile_id": profile_id,
+                }
+            )
+        return False  # GLib.idle_add: run once
 
     def _send_command(self, command: dict) -> bool:
         """Send a command to the tray service."""
@@ -440,6 +580,7 @@ class TrayManager:
             if current_profile_id is not None:
                 self._current_profile_id = current_profile_id
             profile_id_to_send = self._current_profile_id
+            self._current_profiles = list(profiles)
         self._send_command(
             {
                 "action": "update_profiles",
@@ -452,6 +593,9 @@ class TrayManager:
     def stop(self) -> None:
         """Stop the tray service subprocess."""
         with self._state_lock:
+            # _shutting_down tells the stdout reader's exit handler not to
+            # attempt a respawn for THIS process death.
+            self._shutting_down = True
             self._running = False
 
         if self._process is not None:

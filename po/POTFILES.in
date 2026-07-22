@@ -4,7 +4,9 @@
 src/app.py
 src/main.py
 src/cli/help_cmd.py
+src/cli/install_helper.py
 src/cli/history_cmd.py
+src/cli/install_helper.py
 src/cli/profile_cmd.py
 src/cli/quarantine_cmd.py
 src/cli/router.py
@@ -12,6 +14,7 @@ src/cli/scan_cmd.py
 src/cli/scheduled_scan.py
 src/cli/status_cmd.py
 src/notification_dispatcher.py
+src/core/clamav_config.py
 src/core/clamav_detection.py
 src/core/system_audit.py
 src/core/file_manager_integration.py

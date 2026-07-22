@@ -204,6 +204,26 @@ class TestModulesSection:
         has_clamui = any("clamui" in name.lower() for name in module_names)
         assert has_clamui, "Missing clamui module"
 
+    @pytest.mark.parametrize(
+        "manifest_name",
+        [
+            "io.github.linx_systems.ClamUI.yml",
+            "io.github.linx_systems.ClamUI.local.yml",
+        ],
+    )
+    def test_manifest_does_not_bundle_clamav(self, yaml_parser, manifest_name):
+        """Flatpak manifests should require host ClamAV instead of building it."""
+        manifest = PROJECT_ROOT / "flathub" / manifest_name
+        data = yaml_parser.safe_load(manifest.read_text())
+
+        modules = data.get("modules", [])
+        module_names = [m.get("name", "") for m in modules if isinstance(m, dict)]
+        content = manifest.read_text()
+
+        assert "clamav" not in module_names
+        assert "clamav.net/downloads/production" not in content
+        assert "org.freedesktop.Sdk.Extension.rust-stable" not in content
+
 
 class TestIntegrationAssets:
     """Tests for bundled file manager integration assets."""

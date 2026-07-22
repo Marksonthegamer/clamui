@@ -922,9 +922,10 @@ class TestScannerPagePopulateFields:
 
         ScannerPage.populate_fields(mock_config, mock_widgets)
 
-        # Should call set_active with default value (False) for missing boolean keys
-        # This is the new behavior - populate_bool_field now sets default values
-        mock_widgets["ScanPE"].set_active.assert_called_with(False)
+        # Missing file-type keys must default to ON: ClamAV enables ScanPE etc.
+        # by default when absent from clamd.conf, so showing them off would
+        # write "ScanPE no" on the next save and disable scanning features.
+        mock_widgets["ScanPE"].set_active.assert_called_with(True)
         # set_value should not be called for missing numeric keys (different helper)
         mock_widgets["MaxFileSize"].set_value.assert_not_called()
 
